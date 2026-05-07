@@ -1,0 +1,13 @@
+.git
+.github/media
+.symphony
+config
+dist
+logs
+node_modules
+workspaces
+.DS_Store
+*.log
+npm-debug.log*
+Dockerfile
+docker-compose.yml

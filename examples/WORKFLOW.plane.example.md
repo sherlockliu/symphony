@@ -32,6 +32,14 @@ states:
   terminal: ["Done", "Canceled"]
 limits:
   max_concurrency: 1
+retry:
+  max_attempts: 2
+  failure_cooldown_seconds: 300
+  retryable_errors: ["agent_timeout", "network_error", "transient_tracker_error"]
+dashboard:
+  enabled: false
+  host: "127.0.0.1"
+  port: 4000
 ---
 # Agent Task
 

@@ -1,8 +1,10 @@
-import type { Issue, WorkflowConfig } from "../types.js";
+import type { Issue } from "../types.js";
+import type { IssueRunState } from "../state/runStateStore.js";
 import type { HttpClient, HttpRequest, HttpResponse } from "./jiraTracker.js";
+import type { PlaneTrackerConfig } from "./registry.js";
 import type { TrackerAdapter } from "./tracker.js";
 
-type PlaneConfig = Extract<WorkflowConfig["tracker"], { kind: "plane" }>;
+type PlaneConfig = PlaneTrackerConfig;
 
 interface PlaneWorkItemPayload {
   id: string;
@@ -66,6 +68,25 @@ export class PlaneTracker implements TrackerAdapter {
           access: "INTERNAL",
           external_source: "symphony",
           external_id: `symphony-pr-${issue.identifier}`
+        }
+      }
+    );
+  }
+
+  async addNeedsHumanAttentionComment(issue: Issue, state: IssueRunState): Promise<void> {
+    const message = escapeHtml(
+      `Symphony needs human attention after ${state.attemptNumber} attempt(s). Last error: ${state.lastError ?? "unknown"}.`
+    );
+    await this.requestJson(
+      `/api/v1/workspaces/${encodeURIComponent(this.config.workspaceSlug)}/projects/${encodeURIComponent(this.config.projectId)}/work-items/${encodeURIComponent(issue.id)}/comments/`,
+      {
+        method: "POST",
+        body: {
+          comment_html: `<p>${message}</p>`,
+          comment_json: {},
+          access: "INTERNAL",
+          external_source: "symphony",
+          external_id: `symphony-human-attention-${issue.identifier}`
         }
       }
     );

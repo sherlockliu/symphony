@@ -5,21 +5,30 @@ import { filterActiveIssues } from "../trackers/mockTracker.js";
 import { renderPrompt } from "../templates/promptRenderer.js";
 import { GitService } from "../git/gitService.js";
 import { WorkspaceManager } from "../workspaces/workspaceManager.js";
-import { createAgentRunner } from "../agents/createAgentRunner.js";
 import { GitHubPullRequestService } from "../github/pullRequestService.js";
 import { createTracker } from "../trackers/createTracker.js";
-import type { Issue, WorkflowConfig } from "../types.js";
+import { Orchestrator } from "../orchestrator/orchestrator.js";
+import { PollingDaemon } from "../daemon/pollingDaemon.js";
+import { DashboardStatusStore, isDashboardLocalHost } from "../dashboard/statusStore.js";
+import { startDashboardServer, type RunningDashboardServer } from "../dashboard/server.js";
+import { InMemoryRunStateStore } from "../state/runStateStore.js";
+import type { WorkflowConfig } from "../types.js";
 
-type Command = "validate" | "dry-run" | "run";
+type Command = "validate" | "dry-run" | "run" | "daemon";
+
+interface CliOptions {
+  maxCycles?: number;
+}
 
 async function main(argv: string[]): Promise<number> {
-  const [command, workflowPath] = argv;
+  const [command, workflowPath, ...optionArgs] = argv;
   if (!isCommand(command) || workflowPath === undefined) {
     printUsage();
     return 1;
   }
 
   try {
+    const options = parseOptions(optionArgs);
     if (command === "validate") {
       await validateCommand(workflowPath);
       return 0;
@@ -28,7 +37,11 @@ async function main(argv: string[]): Promise<number> {
       await dryRunCommand(workflowPath);
       return 0;
     }
-    await runCommand(workflowPath);
+    if (command === "run") {
+      await runCommand(workflowPath);
+      return 0;
+    }
+    await daemonCommand(workflowPath, options);
     return 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -49,6 +62,9 @@ async function validateCommand(workflowPath: string): Promise<void> {
     branchPrefix: config.branch.prefix,
     agent: config.agent,
     github: config.github,
+    daemon: config.daemon,
+    dashboard: config.dashboard,
+    retry: config.retry,
     maxConcurrency: config.limits.maxConcurrency
   }));
 }
@@ -87,51 +103,17 @@ async function dryRunCommand(workflowPath: string): Promise<void> {
 
 async function runCommand(workflowPath: string): Promise<void> {
   const { definition, config } = await loadWorkflow(workflowPath);
-  const tracker = createTracker(config);
-  const workspaceManager = new WorkspaceManager(config);
-  const git = new GitService(config);
-  const runner = createAgentRunner(config);
-  const pullRequests = new GitHubPullRequestService(config);
-  const issues = await tracker.listIssues();
-  const activeIssues = filterActiveIssues(issues, config.states.active);
+  const result = await new Orchestrator(definition, config).runOnce({
+    onWarning: (message) => {
+      console.error(redactSecrets(`Warning: ${message}`));
+    }
+  });
 
-  for (const issue of activeIssues.slice(0, config.limits.maxConcurrency)) {
-    const workspace = await workspaceManager.createIssueWorkspace(issue);
-    const gitPlan = await git.prepareRepository(issue, workspace);
-    const prompt = renderPrompt(definition.promptTemplate, { issue, config });
-    const agentResult = await runner.run({ issue, workspace, prompt });
-    const pullRequestResult = agentResult.success
-      ? await pullRequests.createDraftPullRequest({
-          issue,
-          workspace,
-          branchName: gitPlan.branchName,
-          baseBranch: config.repository.baseBranch
-        })
-      : {
-          created: false,
-          url: null,
-          skippedReason: "agent_failed",
-          changed: false,
-          logPaths: []
-        };
-    const trackerResult = await updateTrackerAfterPullRequest(tracker, issue, pullRequestResult.url);
-    console.log(redactSecrets({
-      status: agentResult.success ? "completed" : "failed",
-      issue: issue.identifier,
-      workspace: workspace.path,
-      repo: workspace.repoPath,
-      branch: gitPlan.branchName,
-      runner: agentResult.runner,
-      exitCode: agentResult.exitCode,
-      timedOut: agentResult.timedOut,
-      logPath: agentResult.logPath,
-      pullRequest: pullRequestResult,
-      tracker: trackerResult,
-      next: "Symphony never merges PRs"
-    }));
+  for (const issueResult of result.results) {
+    console.log(redactSecrets(issueResult));
   }
 
-  if (activeIssues.length === 0) {
+  if (result.activeIssues === 0) {
     console.log(redactSecrets({
       status: "idle",
       message: "no active mock issues found"
@@ -139,12 +121,106 @@ async function runCommand(workflowPath: string): Promise<void> {
   }
 }
 
+async function daemonCommand(workflowPath: string, cliOptions: CliOptions = {}): Promise<void> {
+  const { definition, config } = await loadWorkflow(workflowPath);
+  const abortController = new AbortController();
+  const statusStore = new DashboardStatusStore(config);
+  const runStateStore = new InMemoryRunStateStore();
+  let dashboardServer: RunningDashboardServer | null = null;
+  const stop = (): void => {
+    abortController.abort();
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+
+  try {
+    if (config.dashboard.enabled) {
+      if (!isDashboardLocalHost(config.dashboard.host)) {
+        console.error(redactSecrets(
+          `Warning: dashboard host ${config.dashboard.host} is not 127.0.0.1 or localhost. Do not expose this dashboard publicly.`
+        ));
+      }
+      dashboardServer = await startDashboardServer(statusStore, config.dashboard);
+      console.log(redactSecrets({
+        status: "dashboard_started",
+        url: dashboardServer.url,
+        host: config.dashboard.host,
+        port: config.dashboard.port
+      }));
+    }
+
+    const daemon = new PollingDaemon(new Orchestrator(definition, config, { stateStore: runStateStore }), {
+      pollIntervalMs: (config.daemon?.pollIntervalSeconds ?? 60) * 1000,
+      signal: abortController.signal,
+      maxCycles: cliOptions.maxCycles,
+      onRunStateUpdated: (state) => {
+        statusStore.recordRunState(state);
+      },
+      onIssueStarted: (issue) => {
+        statusStore.recordIssueStarted(issue);
+      },
+      onIssueCompleted: (summary) => {
+        statusStore.recordIssueCompleted(summary);
+      },
+      onIssueFailed: (issue, error) => {
+        statusStore.recordIssueFailed(issue, error);
+      },
+      onWarning: (message) => {
+        console.error(redactSecrets(`Warning: ${message}`));
+      },
+      logger: (event) => {
+        statusStore.recordDaemonEvent(event);
+        console.log(redactSecrets(event));
+      }
+    });
+    await daemon.start();
+  } finally {
+    if (dashboardServer !== null) {
+      await dashboardServer.close();
+    }
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
+}
+
 function isCommand(value: string | undefined): value is Command {
-  return value === "validate" || value === "dry-run" || value === "run";
+  return value === "validate" || value === "dry-run" || value === "run" || value === "daemon";
 }
 
 function printUsage(): void {
-  console.error("Usage: orchestrator <validate|dry-run|run> ./WORKFLOW.md");
+  console.error([
+    "Usage: orchestrator <validate|dry-run|run|daemon> ./WORKFLOW.md [options]",
+    "",
+    "Options:",
+    "  --max-cycles <n>   Stop daemon mode after n polling cycles.",
+    "",
+    "Examples:",
+    "  orchestrator validate examples/WORKFLOW.quickstart.mock.md",
+    "  orchestrator dry-run examples/WORKFLOW.quickstart.mock.md",
+    "  orchestrator daemon examples/WORKFLOW.dashboard.mock.example.md"
+  ].join("\n"));
+}
+
+function parseOptions(args: string[]): CliOptions {
+  const options: CliOptions = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--max-cycles") {
+      const raw = args[index + 1];
+      if (raw === undefined) {
+        throw new Error("--max-cycles requires a positive integer value.");
+      }
+      const maxCycles = Number(raw);
+      if (!Number.isInteger(maxCycles) || maxCycles < 1) {
+        throw new Error("--max-cycles must be a positive integer.");
+      }
+      options.maxCycles = maxCycles;
+      index += 1;
+      continue;
+    }
+    throw new Error(`Unknown option: ${arg}. Run without arguments to see usage.`);
+  }
+  return options;
 }
 
 function redactTrackerForOutput(tracker: WorkflowConfig["tracker"]): Record<string, unknown> {
@@ -170,35 +246,7 @@ function redactTrackerForOutput(tracker: WorkflowConfig["tracker"]): Record<stri
       reviewState: tracker.reviewState
     };
   }
-  return tracker;
-}
-
-async function updateTrackerAfterPullRequest(
-  tracker: ReturnType<typeof createTracker>,
-  issue: Issue,
-  prUrl: string | null
-): Promise<Record<string, unknown>> {
-  if (prUrl === null) {
-    return {
-      commented: false,
-      transitioned: false,
-      skippedReason: "no_pr_created"
-    };
-  }
-  if (tracker.addPullRequestComment === undefined || tracker.transitionToHumanReview === undefined) {
-    return {
-      commented: false,
-      transitioned: false,
-      skippedReason: "tracker_writeback_not_supported"
-    };
-  }
-
-  await tracker.addPullRequestComment(issue, prUrl);
-  await tracker.transitionToHumanReview(issue);
-  return {
-    commented: true,
-    transitioned: true
-  };
+  return { ...tracker };
 }
 
 main(process.argv.slice(2)).then((code) => {

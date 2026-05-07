@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import { CodexRunner } from "../src/agents/codexRunner.js";
 import { createAgentRunner } from "../src/agents/createAgentRunner.js";
 import { DryRunRunner } from "../src/agents/dryRunRunner.js";
 import type { ProcessExecutor, ProcessRequest, ProcessResult } from "../src/agents/processExecutor.js";
+import type { CodexAgentConfig, DryRunAgentConfig } from "../src/agents/registry.js";
 import type { AgentRunRequest, Issue, IssueWorkspace, WorkflowConfig } from "../src/types.js";
 
 const issue: Issue = {
@@ -27,6 +28,7 @@ const issue: Issue = {
 function workflowConfig(root: string): WorkflowConfig {
   return {
     version: 1,
+    workflowPath: path.join(root, "WORKFLOW.md"),
     tracker: { kind: "mock", issueFile: path.join(root, "issues.json") },
     workspace: { root: path.join(root, "workspaces") },
     repository: {
@@ -42,7 +44,15 @@ function workflowConfig(root: string): WorkflowConfig {
       logDir: path.join(root, "logs")
     },
     states: { active: ["Ready"], terminal: ["Done"] },
-    limits: { maxConcurrency: 1 }
+    limits: { maxConcurrency: 1 },
+    retry: {
+      maxAttempts: 2,
+      failureCooldownSeconds: 300,
+      retryableErrors: ["agent_timeout", "network_error", "transient_tracker_error"],
+      retryWithExistingPullRequest: false,
+      rerunSucceeded: false
+    },
+    dashboard: { enabled: false, host: "127.0.0.1", port: 4000 }
   };
 }
 
@@ -57,14 +67,17 @@ function request(root: string): AgentRunRequest {
   return {
     issue,
     workspace,
-    prompt: "Implement ABC-7 with OPENAI_API_KEY=sk-testsecretvalue"
+    prompt: "Implement ABC-7 with OPENAI_API_KEY=sk-testsecretvalue",
+    workflowPath: path.join(root, "WORKFLOW.md"),
+    timeoutSeconds: 300,
+    logDir: path.join(root, "logs")
   };
 }
 
 test("DryRunRunner captures a redacted prompt log without executing a process", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-agent-"));
   try {
-    const runner = new DryRunRunner(workflowConfig(root));
+    const runner = new DryRunRunner(workflowConfig(root).agent as DryRunAgentConfig);
     const result = await runner.run(request(root));
     const log = await readFile(result.logPath, "utf8");
 
@@ -93,7 +106,7 @@ test("CodexRunner passes prompt, cwd, timeout, and log path to process executor"
   };
 
   try {
-    const config: Extract<WorkflowConfig["agent"], { kind: "codex" }> = {
+    const config: CodexAgentConfig = {
       kind: "codex",
       command: "codex",
       args: ["exec", "-"],
@@ -130,7 +143,7 @@ test("CodexRunner reports timeout failures", async () => {
   };
 
   try {
-    const config: Extract<WorkflowConfig["agent"], { kind: "codex" }> = {
+    const config: CodexAgentConfig = {
       kind: "codex",
       command: "codex",
       args: ["exec", "-"],
@@ -142,6 +155,38 @@ test("CodexRunner reports timeout failures", async () => {
     assert.equal(result.success, false);
     assert.equal(result.exitCode, null);
     assert.equal(result.timedOut, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodexRunner captures stdout and stderr while process logs redact secrets", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-codex-redact-"));
+  try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
+    const config: CodexAgentConfig = {
+      kind: "codex",
+      command: "node",
+      args: [
+        "-e",
+        [
+          "console.log('OPENAI_API_KEY=sk-testsecretvalue');",
+          "console.error('Bearer abcdefghijklmnop');"
+        ].join("")
+      ],
+      timeoutSeconds: 10,
+      logDir: path.join(root, "logs")
+    };
+    const result = await new CodexRunner(config).run(request(root));
+    const log = await readFile(result.logPath, "utf8");
+
+    assert.equal(result.success, true);
+    assert.match(result.stdout, /OPENAI_API_KEY=sk-testsecretvalue/);
+    assert.match(result.stderr, /Bearer abcdefghijklmnop/);
+    assert.match(log, /OPENAI_API_KEY=\[REDACTED\]/);
+    assert.match(log, /Bearer \[REDACTED\]/);
+    assert.equal(log.includes("sk-testsecretvalue"), false);
+    assert.equal(log.includes("abcdefghijklmnop"), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

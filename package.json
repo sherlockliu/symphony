@@ -9,8 +9,16 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
+    "lint": "tsc -p tsconfig.json --noEmit",
     "validate": "npm run build && node dist/src/cli/index.js validate",
-    "dry-run": "npm run build && node dist/src/cli/index.js dry-run"
+    "dry-run": "npm run build && node dist/src/cli/index.js dry-run",
+    "daemon": "npm run build && node dist/src/cli/index.js daemon",
+    "validate:mock": "npm run build && node dist/src/cli/index.js validate examples/WORKFLOW.quickstart.mock.md",
+    "dry-run:mock": "npm run build && node dist/src/cli/index.js dry-run examples/WORKFLOW.quickstart.mock.md",
+    "daemon:mock": "npm run build && node dist/src/cli/index.js daemon examples/WORKFLOW.dashboard.mock.example.md",
+    "daemon:mock:once": "npm run build && node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cycles 1",
+    "docker:build": "docker build -t owned-symphony:local .",
+    "docker:dry-run": "npm run docker:build && mkdir -p config workspaces logs && cp examples/WORKFLOW.docker.mock.example.md config/WORKFLOW.md && cp examples/mock-issues.json config/mock-issues.json && docker compose run --rm orchestrator dry-run /config/WORKFLOW.md"
   },
   "engines": {
     "node": ">=22"
