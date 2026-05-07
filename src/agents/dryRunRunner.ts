@@ -1,14 +1,15 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentRunRequest, AgentRunResult, WorkflowConfig } from "../types.js";
+import type { AgentRunRequest, AgentRunResult } from "../types.js";
 import { redactSecrets } from "../logging/redact.js";
 import { sanitizePathSegment } from "../workspaces/pathSafety.js";
 import type { AgentRunner } from "./agentRunner.js";
+import type { DryRunAgentConfig } from "./registry.js";
 
 export class DryRunRunner implements AgentRunner {
   readonly kind = "dry-run";
 
-  constructor(private readonly config: WorkflowConfig) {}
+  constructor(private readonly config: DryRunAgentConfig) {}
 
   async run(request: AgentRunRequest): Promise<AgentRunResult> {
     const logPath = this.logPathFor(request);
@@ -38,6 +39,6 @@ export class DryRunRunner implements AgentRunner {
   }
 
   private logPathFor(request: AgentRunRequest): string {
-    return path.join(this.config.agent.logDir, `${sanitizePathSegment(request.issue.identifier)}-dry-run.log`);
+    return path.join(this.config.logDir, `${sanitizePathSegment(request.issue.identifier)}-dry-run.log`);
   }
 }

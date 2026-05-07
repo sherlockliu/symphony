@@ -1,3 +1,6 @@
+import type { AgentConfig } from "./agents/registry.js";
+import type { TrackerConfig } from "./trackers/registry.js";
+
 export type Scalar = string | number | boolean | null;
 export type JsonValue = Scalar | JsonValue[] | { [key: string]: JsonValue };
 
@@ -8,29 +11,8 @@ export interface WorkflowDefinition {
 
 export interface WorkflowConfig {
   version: 1;
-  tracker:
-    | {
-        kind: "mock";
-        issueFile: string;
-      }
-    | {
-        kind: "jira";
-        baseUrl: string;
-        email: string;
-        apiToken: string;
-        jql: string;
-        maxResults: number;
-        reviewTransition: string;
-      }
-    | {
-        kind: "plane";
-        baseUrl: string;
-        apiKey: string;
-        workspaceSlug: string;
-        projectId: string;
-        maxResults: number;
-        reviewState: string;
-      };
+  workflowPath: string;
+  tracker: TrackerConfig;
   workspace: {
     root: string;
   };
@@ -48,25 +30,28 @@ export interface WorkflowConfig {
     draft: true;
     logDir: string;
   };
-  agent:
-    | {
-        kind: "dry-run";
-        timeoutSeconds: number;
-        logDir: string;
-      }
-    | {
-        kind: "codex";
-        command: string;
-        args: string[];
-        timeoutSeconds: number;
-        logDir: string;
-      };
+  agent: AgentConfig;
   states: {
     active: string[];
     terminal: string[];
   };
   limits: {
     maxConcurrency: number;
+  };
+  retry: {
+    maxAttempts: number;
+    failureCooldownSeconds: number;
+    retryableErrors: string[];
+    retryWithExistingPullRequest: boolean;
+    rerunSucceeded: boolean;
+  };
+  daemon?: {
+    pollIntervalSeconds: number;
+  };
+  dashboard: {
+    enabled: boolean;
+    host: string;
+    port: number;
   };
 }
 
@@ -100,6 +85,9 @@ export interface AgentRunRequest {
   issue: Issue;
   workspace: IssueWorkspace;
   prompt: string;
+  workflowPath: string;
+  timeoutSeconds: number;
+  logDir: string;
 }
 
 export interface AgentRunResult {
@@ -125,4 +113,43 @@ export interface PullRequestResult {
   skippedReason: string | null;
   changed: boolean;
   logPaths: string[];
+}
+
+export interface TrackerUpdateResult {
+  commented: boolean;
+  transitioned: boolean;
+  skippedReason?: string;
+}
+
+export interface IssueRunSummary {
+  status: "completed" | "failed";
+  issueId: string;
+  issue: string;
+  workspace: string;
+  repo: string;
+  branch: string;
+  runner: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  logPath: string;
+  pullRequest: PullRequestResult;
+  tracker: TrackerUpdateResult;
+  next: string;
+}
+
+export interface OrchestratorRunOptions {
+  excludeIssueIds?: ReadonlySet<string>;
+  onIssueStarted?: (issue: Issue) => void;
+  onIssueCompleted?: (summary: IssueRunSummary) => void;
+  onIssueFailed?: (issue: Issue, error: unknown) => void;
+  onRunStateUpdated?: (state: import("./state/runStateStore.js").IssueRunState) => void;
+  onWarning?: (message: string) => void;
+}
+
+export interface OrchestratorCycleResult {
+  totalIssues: number;
+  activeIssues: number;
+  eligibleIssues: number;
+  processedIssues: number;
+  results: IssueRunSummary[];
 }

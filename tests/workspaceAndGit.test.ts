@@ -29,6 +29,7 @@ const issue: Issue = {
 function config(root: string): WorkflowConfig {
   return {
     version: 1,
+    workflowPath: path.join(root, "WORKFLOW.md"),
     tracker: { kind: "mock", issueFile: "/tmp/issues.json" },
     workspace: { root },
     repository: {
@@ -40,7 +41,15 @@ function config(root: string): WorkflowConfig {
     github: { kind: "gh", remote: "origin", draft: true, logDir: path.join(root, "logs") },
     agent: { kind: "dry-run", timeoutSeconds: 300, logDir: path.join(root, "logs") },
     states: { active: ["Ready"], terminal: ["Done"] },
-    limits: { maxConcurrency: 1 }
+    limits: { maxConcurrency: 1 },
+    retry: {
+      maxAttempts: 2,
+      failureCooldownSeconds: 300,
+      retryableErrors: ["agent_timeout", "network_error", "transient_tracker_error"],
+      retryWithExistingPullRequest: false,
+      rerunSucceeded: false
+    },
+    dashboard: { enabled: false, host: "127.0.0.1", port: 4000 }
   };
 }
 

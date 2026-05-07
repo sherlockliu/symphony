@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseWorkflow } from "../src/workflow/frontMatter.js";
+import { loadWorkflow } from "../src/workflow/load.js";
 import { validateWorkflow } from "../src/workflow/schema.js";
 import { interpolateEnv } from "../src/config/env.js";
 
@@ -62,6 +63,7 @@ test("validateWorkflow resolves env values and normalizes paths", () => {
 
     assert.equal(config.tracker.kind, "mock");
     assert.equal(config.agent.kind, "dry-run");
+    assert.equal(config.workflowPath, "/repo/examples/WORKFLOW.md");
     assert.equal(config.limits.maxConcurrency, 1);
     assert.equal(config.workspace.root, "/repo/examples/tmp/workspaces");
     assert.equal(config.tracker.issueFile, "/repo/examples/mock-issues.json");
@@ -75,6 +77,15 @@ test("validateWorkflow resolves env values and normalizes paths", () => {
     assert.equal(config.github.logDir, "/repo/examples/logs");
     assert.equal(config.agent.timeoutSeconds, 300);
     assert.equal(config.agent.logDir, "/repo/examples/logs");
+    assert.equal(config.daemon?.pollIntervalSeconds, 60);
+    assert.deepEqual(config.retry, {
+      maxAttempts: 2,
+      failureCooldownSeconds: 300,
+      retryableErrors: ["agent_timeout", "network_error", "transient_tracker_error"],
+      retryWithExistingPullRequest: false,
+      rerunSucceeded: false
+    });
+    assert.deepEqual(config.dashboard, { enabled: false, host: "127.0.0.1", port: 4000 });
   } finally {
     if (previous === undefined) {
       delete process.env.WORKSPACE_ROOT;
@@ -82,6 +93,112 @@ test("validateWorkflow resolves env values and normalizes paths", () => {
       process.env.WORKSPACE_ROOT = previous;
     }
   }
+});
+
+test("validateWorkflow accepts daemon poll interval configuration", () => {
+  const workflow = validWorkflow
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+    .replace(
+      "limits:\n  max_concurrency: 1",
+      "limits:\n  max_concurrency: 1\ndaemon:\n  poll_interval_seconds: 15"
+    );
+  const parsed = parseWorkflow(workflow);
+  const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
+
+  assert.equal(config.daemon?.pollIntervalSeconds, 15);
+});
+
+test("validateWorkflow rejects invalid daemon poll intervals", () => {
+  const workflow = validWorkflow
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+    .replace(
+      "limits:\n  max_concurrency: 1",
+      "limits:\n  max_concurrency: 1\ndaemon:\n  poll_interval_seconds: 0"
+    );
+  const parsed = parseWorkflow(workflow);
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/examples/WORKFLOW.md"),
+    /daemon.poll_interval_seconds must be greater than or equal to 1/
+  );
+});
+
+test("validateWorkflow accepts dashboard configuration", () => {
+  const workflow = validWorkflow
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+    .replace(
+      "limits:\n  max_concurrency: 1",
+      [
+        "limits:",
+        "  max_concurrency: 1",
+        "dashboard:",
+        "  enabled: true",
+        "  host: localhost",
+        "  port: 4100"
+      ].join("\n")
+    );
+  const parsed = parseWorkflow(workflow);
+  const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
+
+  assert.deepEqual(config.dashboard, { enabled: true, host: "localhost", port: 4100 });
+});
+
+test("validateWorkflow rejects invalid dashboard ports", () => {
+  const workflow = validWorkflow
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+    .replace(
+      "limits:\n  max_concurrency: 1",
+      "limits:\n  max_concurrency: 1\ndashboard:\n  port: 70000"
+    );
+  const parsed = parseWorkflow(workflow);
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/examples/WORKFLOW.md"),
+    /dashboard.port must be an integer between 1 and 65535/
+  );
+});
+
+test("validateWorkflow accepts retry configuration", () => {
+  const workflow = validWorkflow
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+    .replace(
+      "limits:\n  max_concurrency: 1",
+      [
+        "limits:",
+        "  max_concurrency: 1",
+        "retry:",
+        "  max_attempts: 3",
+        "  failure_cooldown_seconds: 10",
+        "  retryable_errors: [\"agent_timeout\", \"network_error\"]",
+        "  retry_with_existing_pull_request: true",
+        "  rerun_succeeded: true"
+      ].join("\n")
+    );
+  const parsed = parseWorkflow(workflow);
+  const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
+
+  assert.deepEqual(config.retry, {
+    maxAttempts: 3,
+    failureCooldownSeconds: 10,
+    retryableErrors: ["agent_timeout", "network_error"],
+    retryWithExistingPullRequest: true,
+    rerunSucceeded: true
+  });
+});
+
+test("validateWorkflow rejects invalid retry configuration", () => {
+  const workflow = validWorkflow
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+    .replace(
+      "limits:\n  max_concurrency: 1",
+      "limits:\n  max_concurrency: 1\nretry:\n  max_attempts: 0"
+    );
+  const parsed = parseWorkflow(workflow);
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/examples/WORKFLOW.md"),
+    /retry.max_attempts must be an integer greater than or equal to 1/
+  );
 });
 
 test("validateWorkflow rejects non-draft GitHub PR configuration", () => {
@@ -103,6 +220,13 @@ test("interpolateEnv rejects missing variables", () => {
   );
 });
 
+test("loadWorkflow reports missing workflow paths with an actionable message", async () => {
+  await assert.rejects(
+    () => loadWorkflow("/tmp/does-not-exist/WORKFLOW.md"),
+    /Workflow file not found: .*examples\/WORKFLOW\.quickstart\.mock\.md/
+  );
+});
+
 test("validateWorkflow rejects unsupported tracker kinds", () => {
   const parsed = parseWorkflow(
     validWorkflow
@@ -112,7 +236,20 @@ test("validateWorkflow rejects unsupported tracker kinds", () => {
 
   assert.throws(
     () => validateWorkflow(parsed, "/repo/WORKFLOW.md"),
-    /tracker.kind must be mock, jira, or plane/
+    /tracker.kind must be one of:/
+  );
+});
+
+test("validateWorkflow rejects unsupported agent runner kinds", () => {
+  const parsed = parseWorkflow(
+    validWorkflow
+      .replace("kind: dry-run", "kind: claude-code")
+      .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+  );
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/WORKFLOW.md"),
+    /agent.kind must be one of:/
   );
 });
 

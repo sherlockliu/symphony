@@ -1,0 +1,44 @@
+x-orchestrator-base: &orchestrator-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: owned-symphony:local
+  init: true
+  working_dir: /app
+  environment:
+    JIRA_EMAIL: ${JIRA_EMAIL:-}
+    JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
+    PLANE_API_KEY: ${PLANE_API_KEY:-}
+    GH_TOKEN: ${GH_TOKEN:-}
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  volumes:
+    - ./config:/config:ro
+    - ./workspaces:/workspaces
+    - ./logs:/logs
+  network_mode: bridge
+
+services:
+  orchestrator:
+    <<: *orchestrator-base
+    command: ["validate", "/config/WORKFLOW.md"]
+
+  validate:
+    <<: *orchestrator-base
+    profiles: ["validate"]
+    command: ["validate", "/config/WORKFLOW.md"]
+
+  dry-run:
+    <<: *orchestrator-base
+    profiles: ["dry-run"]
+    command: ["dry-run", "/config/WORKFLOW.md"]
+
+  run:
+    <<: *orchestrator-base
+    profiles: ["run"]
+    command: ["run", "/config/WORKFLOW.md"]
+
+  daemon:
+    <<: *orchestrator-base
+    profiles: ["daemon"]
+    command: ["daemon", "/config/WORKFLOW.md"]

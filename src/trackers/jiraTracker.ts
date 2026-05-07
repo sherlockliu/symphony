@@ -1,7 +1,9 @@
-import type { Issue, WorkflowConfig } from "../types.js";
+import type { Issue } from "../types.js";
+import type { IssueRunState } from "../state/runStateStore.js";
+import type { JiraTrackerConfig } from "./registry.js";
 import type { TrackerAdapter } from "./tracker.js";
 
-type JiraConfig = Extract<WorkflowConfig["tracker"], { kind: "jira" }>;
+type JiraConfig = JiraTrackerConfig;
 
 export interface HttpRequest {
   method: string;
@@ -84,6 +86,17 @@ export class JiraTracker implements TrackerAdapter {
       method: "POST",
       body: {
         body: adfText(`Draft PR created by Symphony: ${prUrl}`)
+      }
+    });
+  }
+
+  async addNeedsHumanAttentionComment(issue: Issue, state: IssueRunState): Promise<void> {
+    await this.requestJson(`/rest/api/3/issue/${encodeURIComponent(issue.identifier)}/comment`, {
+      method: "POST",
+      body: {
+        body: adfText(
+          `Symphony needs human attention after ${state.attemptNumber} attempt(s). Last error: ${state.lastError ?? "unknown"}.`
+        )
       }
     });
   }

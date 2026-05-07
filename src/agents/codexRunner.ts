@@ -1,14 +1,15 @@
 import path from "node:path";
-import type { AgentRunRequest, AgentRunResult, WorkflowConfig } from "../types.js";
+import type { AgentRunRequest, AgentRunResult } from "../types.js";
 import { sanitizePathSegment } from "../workspaces/pathSafety.js";
 import type { AgentRunner } from "./agentRunner.js";
 import { NodeProcessExecutor, type ProcessExecutor } from "./processExecutor.js";
+import type { CodexAgentConfig } from "./registry.js";
 
 export class CodexRunner implements AgentRunner {
   readonly kind = "codex";
 
   constructor(
-    private readonly config: Extract<WorkflowConfig["agent"], { kind: "codex" }>,
+    private readonly config: CodexAgentConfig,
     private readonly executor: ProcessExecutor = new NodeProcessExecutor()
   ) {}
 

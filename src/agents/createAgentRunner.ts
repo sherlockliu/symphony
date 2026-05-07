@@ -1,12 +1,8 @@
-import type { WorkflowConfig } from "../types.js";
+import type { AgentConfig } from "./registry.js";
 import type { AgentRunner } from "./agentRunner.js";
-import { CodexRunner } from "./codexRunner.js";
-import { DryRunRunner } from "./dryRunRunner.js";
 import type { ProcessExecutor } from "./processExecutor.js";
+import { createAgentRunnerFromRegistry } from "./registry.js";
 
-export function createAgentRunner(config: WorkflowConfig, executor?: ProcessExecutor): AgentRunner {
-  if (config.agent.kind === "codex") {
-    return new CodexRunner(config.agent, executor);
-  }
-  return new DryRunRunner(config);
+export function createAgentRunner(config: { agent: AgentConfig }, executor?: ProcessExecutor): AgentRunner {
+  return createAgentRunnerFromRegistry(config.agent, { executor });
 }
