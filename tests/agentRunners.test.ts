@@ -1,0 +1,163 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import assert from "node:assert/strict";
+import { CodexRunner } from "../src/agents/codexRunner.js";
+import { createAgentRunner } from "../src/agents/createAgentRunner.js";
+import { DryRunRunner } from "../src/agents/dryRunRunner.js";
+import type { ProcessExecutor, ProcessRequest, ProcessResult } from "../src/agents/processExecutor.js";
+import type { AgentRunRequest, Issue, IssueWorkspace, WorkflowConfig } from "../src/types.js";
+
+const issue: Issue = {
+  id: "1",
+  identifier: "ABC-7",
+  title: "Run agent",
+  description: "Exercise process runner.",
+  priority: 1,
+  state: "Ready",
+  branchName: null,
+  url: null,
+  labels: [],
+  blockedBy: [],
+  createdAt: null,
+  updatedAt: null
+};
+
+function workflowConfig(root: string): WorkflowConfig {
+  return {
+    version: 1,
+    tracker: { kind: "mock", issueFile: path.join(root, "issues.json") },
+    workspace: { root: path.join(root, "workspaces") },
+    repository: {
+      url: root,
+      baseBranch: "main",
+      cloneDir: "repo"
+    },
+    branch: { prefix: "symphony" },
+    github: { kind: "gh", remote: "origin", draft: true, logDir: path.join(root, "logs") },
+    agent: {
+      kind: "dry-run",
+      timeoutSeconds: 300,
+      logDir: path.join(root, "logs")
+    },
+    states: { active: ["Ready"], terminal: ["Done"] },
+    limits: { maxConcurrency: 1 }
+  };
+}
+
+function request(root: string): AgentRunRequest {
+  const workspace: IssueWorkspace = {
+    issueKey: "ABC-7",
+    path: path.join(root, "workspaces", "ABC-7"),
+    repoPath: path.join(root, "workspaces", "ABC-7", "repo"),
+    createdNow: true
+  };
+
+  return {
+    issue,
+    workspace,
+    prompt: "Implement ABC-7 with OPENAI_API_KEY=sk-testsecretvalue"
+  };
+}
+
+test("DryRunRunner captures a redacted prompt log without executing a process", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-agent-"));
+  try {
+    const runner = new DryRunRunner(workflowConfig(root));
+    const result = await runner.run(request(root));
+    const log = await readFile(result.logPath, "utf8");
+
+    assert.equal(result.success, true);
+    assert.equal(result.runner, "dry-run");
+    assert.match(log, /runner: dry-run/);
+    assert.match(log, /OPENAI_API_KEY=\[REDACTED\]/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodexRunner passes prompt, cwd, timeout, and log path to process executor", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-codex-"));
+  const calls: ProcessRequest[] = [];
+  const executor: ProcessExecutor = {
+    async execute(processRequest: ProcessRequest): Promise<ProcessResult> {
+      calls.push(processRequest);
+      return {
+        exitCode: 0,
+        timedOut: false,
+        stdout: "ok",
+        stderr: ""
+      };
+    }
+  };
+
+  try {
+    const config: Extract<WorkflowConfig["agent"], { kind: "codex" }> = {
+      kind: "codex",
+      command: "codex",
+      args: ["exec", "-"],
+      timeoutSeconds: 42,
+      logDir: path.join(root, "logs")
+    };
+    const result = await new CodexRunner(config, executor).run(request(root));
+
+    assert.equal(result.success, true);
+    assert.equal(result.runner, "codex");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.command, "codex");
+    assert.deepEqual(calls[0]!.args, ["exec", "-"]);
+    assert.equal(calls[0]!.cwd, path.join(root, "workspaces", "ABC-7", "repo"));
+    assert.equal(calls[0]!.input, request(root).prompt);
+    assert.equal(calls[0]!.timeoutMs, 42000);
+    assert.equal(calls[0]!.logPath, path.join(root, "logs", "ABC-7-codex.log"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodexRunner reports timeout failures", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-codex-timeout-"));
+  const executor: ProcessExecutor = {
+    async execute(): Promise<ProcessResult> {
+      return {
+        exitCode: null,
+        timedOut: true,
+        stdout: "",
+        stderr: "timed out"
+      };
+    }
+  };
+
+  try {
+    const config: Extract<WorkflowConfig["agent"], { kind: "codex" }> = {
+      kind: "codex",
+      command: "codex",
+      args: ["exec", "-"],
+      timeoutSeconds: 1,
+      logDir: path.join(root, "logs")
+    };
+    const result = await new CodexRunner(config, executor).run(request(root));
+
+    assert.equal(result.success, false);
+    assert.equal(result.exitCode, null);
+    assert.equal(result.timedOut, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("createAgentRunner keeps runner construction behind the generic interface", () => {
+  const root = "/tmp/symphony";
+  assert.equal(createAgentRunner(workflowConfig(root)).kind, "dry-run");
+  assert.equal(createAgentRunner({
+    ...workflowConfig(root),
+    agent: {
+      kind: "codex",
+      command: "codex",
+      args: ["exec", "-"],
+      timeoutSeconds: 60,
+      logDir: path.join(root, "logs")
+    }
+  }).kind, "codex");
+});

@@ -1,0 +1,30 @@
+[
+  {
+    "id": "mock-1",
+    "identifier": "MOCK-1",
+    "title": "Add a friendly validation error",
+    "description": "Return clear validation output when WORKFLOW.md is malformed.",
+    "priority": 1,
+    "state": "Ready",
+    "branch_name": "mock-1-validation-error",
+    "url": "https://tracker.example/MOCK-1",
+    "labels": ["CLI", "Validation"],
+    "blocked_by": [],
+    "created_at": "2026-05-01T10:00:00Z",
+    "updated_at": "2026-05-02T10:00:00Z"
+  },
+  {
+    "id": "mock-2",
+    "identifier": "MOCK-2",
+    "title": "Document the dry-run command",
+    "description": "Show how mock issues render into prompts.",
+    "priority": 2,
+    "state": "Done",
+    "branch_name": "mock-2-dry-run-docs",
+    "url": "https://tracker.example/MOCK-2",
+    "labels": ["Docs"],
+    "blocked_by": [],
+    "created_at": "2026-05-01T11:00:00Z",
+    "updated_at": "2026-05-03T10:00:00Z"
+  }
+]

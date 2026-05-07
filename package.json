@@ -1,0 +1,22 @@
+{
+  "name": "owned-symphony",
+  "version": "0.1.0",
+  "description": "Tracker-agnostic coding-agent orchestrator skeleton.",
+  "type": "module",
+  "bin": {
+    "orchestrator": "./dist/src/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
+    "validate": "npm run build && node dist/src/cli/index.js validate",
+    "dry-run": "npm run build && node dist/src/cli/index.js dry-run"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  }
+}
