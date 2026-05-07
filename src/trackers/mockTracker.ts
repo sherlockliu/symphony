@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { Issue } from "../types.js";
-import type { TrackerAdapter } from "./tracker.js";
+import { type TrackerAdapter, type TrackerCapabilities } from "./tracker.js";
 
 interface MockIssueInput {
   id: string;
@@ -22,6 +22,13 @@ interface MockIssueInput {
 }
 
 export class MockTracker implements TrackerAdapter {
+  readonly capabilities: TrackerCapabilities = {
+    canComment: false,
+    canTransition: false,
+    canFetchByQuery: false,
+    canFetchByLabel: false
+  };
+
   constructor(private readonly issueFile: string) {}
 
   async listIssues(): Promise<Issue[]> {
@@ -32,11 +39,6 @@ export class MockTracker implements TrackerAdapter {
     }
     return parsed.map((issue, index) => normalizeIssue(issue as MockIssueInput, index));
   }
-}
-
-export function filterActiveIssues(issues: Issue[], activeStates: string[]): Issue[] {
-  const active = new Set(activeStates);
-  return issues.filter((issue) => active.has(issue.state));
 }
 
 function normalizeIssue(issue: MockIssueInput, index: number): Issue {

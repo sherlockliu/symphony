@@ -13,6 +13,7 @@ export interface WorkflowConfig {
   version: 1;
   workflowPath: string;
   tracker: TrackerConfig;
+  state: StateConfig;
   workspace: {
     root: string;
   };
@@ -55,6 +56,16 @@ export interface WorkflowConfig {
   };
 }
 
+export type StateConfig =
+  | {
+      kind: "memory";
+    }
+  | {
+      kind: "postgres";
+      connectionString: string;
+      lockTtlSeconds: number;
+    };
+
 export interface Issue {
   id: string;
   identifier: string;
@@ -93,11 +104,20 @@ export interface AgentRunRequest {
 export interface AgentRunResult {
   success: boolean;
   runner: string;
+  summary?: string;
   exitCode: number | null;
   timedOut: boolean;
   logPath: string;
+  logsPath?: string;
   stdout: string;
   stderr: string;
+  branchName?: string;
+  pullRequestUrl?: string;
+  error?: {
+    type: string;
+    message: string;
+    retryable: boolean;
+  };
 }
 
 export interface PullRequestRequest {

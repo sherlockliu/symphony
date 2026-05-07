@@ -19,8 +19,8 @@ test("retry cooldown prevents immediate retry of retryable failures", async () =
   assert.equal(first.processedIssues, 1);
   assert.equal(second.processedIssues, 0);
   assert.equal(runner.calls, 1);
-  assert.equal((await store.get(issue.id))?.state, "failed");
-  assert.equal((await store.get(issue.id))?.lastError, "agent_timeout");
+  assert.equal((await store.getByIssueId(issue.id))?.state, "failed_retryable");
+  assert.equal((await store.getByIssueId(issue.id))?.lastErrorType, "agent_timeout");
 });
 
 test("retryable failures run again after cooldown", async () => {
@@ -38,8 +38,8 @@ test("retryable failures run again after cooldown", async () => {
 
   assert.equal(second.processedIssues, 1);
   assert.equal(runner.calls, 2);
-  const state = await store.get(issue.id);
-  assert.equal(state?.attemptNumber, 2);
+  const state = await store.getByIssueId(issue.id);
+  assert.equal(state?.attemptCount, 2);
   assert.equal(state?.state, "succeeded");
 });
 
@@ -57,9 +57,9 @@ test("max attempts marks issue as needs_human_attention", async () => {
 
   await subject.runOnce();
 
-  const state = await store.get(issue.id);
+  const state = await store.getByIssueId(issue.id);
   assert.equal(state?.state, "needs_human_attention");
-  assert.equal(state?.attemptNumber, 1);
+  assert.equal(state?.attemptCount, 1);
   assert.equal(comments.length, 1);
 });
 
@@ -71,16 +71,16 @@ test("non-retryable errors are not retried", async () => {
   await subject.runOnce();
   const second = await subject.runOnce();
 
-  const state = await store.get(issue.id);
-  assert.equal(state?.state, "needs_human_attention");
-  assert.equal(state?.lastError, "agent_failed");
+  const state = await store.getByIssueId(issue.id);
+  assert.equal(state?.state, "failed_terminal");
+  assert.equal(state?.lastErrorType, "agent_failed");
   assert.equal(second.processedIssues, 0);
   assert.equal(runner.calls, 1);
 });
 
 test("issue moved out of candidate state is skipped when not running", async () => {
   const store = new InMemoryRunStateStore();
-  await store.upsert(state({ state: "failed", lastError: "agent_timeout" }));
+  await store.upsert(state({ state: "failed_retryable", lastErrorType: "agent_timeout" }));
   const tracker = trackerWith([{ ...issue, state: "Done" }]);
   const runner = runnerWith([{ success: true }]);
   const subject = makeOrchestrator({ store, tracker, runner });
@@ -89,20 +89,36 @@ test("issue moved out of candidate state is skipped when not running", async () 
 
   assert.equal(result.processedIssues, 0);
   assert.equal(runner.calls, 0);
-  assert.equal((await store.get(issue.id))?.state, "skipped");
-  assert.equal((await store.get(issue.id))?.trackerStateLatest, "Done");
+  assert.equal((await store.getByIssueId(issue.id))?.state, "cancelled");
+  assert.equal((await store.getByIssueId(issue.id))?.trackerStateLatest, "Done");
 });
 
 test("existing pull request URL prevents retry by default", async () => {
   const store = new InMemoryRunStateStore();
   await store.upsert(state({
-    state: "failed",
-    lastError: "agent_timeout",
+    state: "failed_retryable",
+    lastErrorType: "agent_timeout",
     pullRequestUrl: "https://github.com/acme/repo/pull/3",
     completedAt: "2026-05-07T11:00:00.000Z"
   }));
   const runner = runnerWith([{ success: true }]);
   const subject = makeOrchestrator({ store, runner, now: clock("2026-05-07T12:00:00.000Z") });
+
+  const result = await subject.runOnce();
+
+  assert.equal(result.processedIssues, 0);
+  assert.equal(runner.calls, 0);
+});
+
+test("succeeded issues are not rerun by default", async () => {
+  const store = new InMemoryRunStateStore();
+  await store.upsert(state({
+    state: "succeeded",
+    attemptCount: 1,
+    completedAt: "2026-05-07T11:00:00.000Z"
+  }));
+  const runner = runnerWith([{ success: true }]);
+  const subject = makeOrchestrator({ store, runner });
 
   const result = await subject.runOnce();
 
@@ -120,7 +136,7 @@ test("duplicate active run is not started", async () => {
 
   assert.equal(result.processedIssues, 0);
   assert.equal(runner.calls, 0);
-  assert.equal((await store.get(issue.id))?.state, "running_agent");
+  assert.equal((await store.getByIssueId(issue.id))?.state, "running_agent");
 });
 
 const issue: Issue = {
@@ -226,6 +242,7 @@ function config(overrides: Partial<WorkflowConfig> = {}): WorkflowConfig {
     version: 1,
     workflowPath: "/tmp/WORKFLOW.md",
     tracker: { kind: "mock", issueFile: "/tmp/issues.json" },
+    state: { kind: "memory" },
     workspace: { root: "/tmp/workspaces" },
     repository: { url: "https://github.com/acme/repo.git", baseBranch: "main", cloneDir: "repo" },
     branch: { prefix: "symphony" },
@@ -256,20 +273,31 @@ function defaultRetry(): WorkflowConfig["retry"] {
 
 function state(overrides: Partial<IssueRunState> = {}): IssueRunState {
   return {
-    issueId: issue.id,
+    id: "run-1",
+    trackerKind: "mock",
+    trackerIssueId: issue.id,
     issueIdentifier: issue.identifier,
-    attemptNumber: 1,
-    state: "failed",
+    issueUrl: issue.url,
+    issueTitle: issue.title,
+    attemptCount: 1,
+    maxAttempts: 2,
+    state: "failed_retryable",
+    createdAt: "2026-05-07T11:55:00.000Z",
     startedAt: "2026-05-07T11:55:00.000Z",
     updatedAt: "2026-05-07T11:55:00.000Z",
     completedAt: "2026-05-07T11:55:00.000Z",
-    lastError: "agent_timeout",
+    lastErrorType: "agent_timeout",
+    lastErrorMessage: "Agent runner timed out.",
     workspacePath: `/tmp/workspaces/${issue.identifier}`,
     branchName: "symphony/abc-1",
     pullRequestUrl: null,
     trackerStateAtStart: "Ready",
     trackerStateLatest: "Ready",
     logsPath: "/tmp/logs/ABC-1.log",
+    nextRetryAt: null,
+    lockOwner: null,
+    lockExpiresAt: null,
+    metadata: {},
     ...overrides
   };
 }

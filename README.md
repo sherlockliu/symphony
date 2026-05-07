@@ -34,27 +34,32 @@ prepares code changes for human review through draft GitHub pull requests.
 - [Architecture](#architecture)
 - [Repository Layout](#repository-layout)
 - [Requirements](#requirements)
-- [Quick Start](#quick-start)
+- [Local Mock Quick Start](#local-mock-quick-start)
 - [Docker Runtime](#docker-runtime)
 - [Workflow Configuration](#workflow-configuration)
 - [CLI Commands](#cli-commands)
 - [Runtime Behavior](#runtime-behavior)
-- [Extending the Project](#extending-the-project)
+- [Production Readiness](#production-readiness)
+- [State Persistence](#state-persistence)
+- [Adding Trackers](#adding-trackers)
+- [Adding Agent Runners](#adding-agent-runners)
 - [Safety Model](#safety-model)
+- [Safety Checklist](#safety-checklist)
 - [Tests](#tests)
 - [Roadmap](#roadmap)
 
 ### Project Overview
 
-This project is an owned Symphony-style orchestrator that connects issue trackers such as Jira and
-Plane to coding agents such as Codex. It reads eligible issues, creates isolated workspaces, renders
-prompts from `WORKFLOW.md`, runs an agent, and prepares code changes for human review.
+This project is an owned Symphony-style orchestrator that connects issue trackers such as Jira,
+Plane, and GitHub Issues to coding agents such as Codex. It reads eligible issues, creates isolated
+workspaces, renders prompts from `WORKFLOW.md`, runs an agent, and prepares code changes for human
+review.
 
 It solves a narrow automation problem:
 
 | Problem | Current implementation |
 | --- | --- |
-| Work lives in trackers | Mock, Jira, and Plane tracker adapters normalize issues into one `Issue` model. |
+| Work lives in trackers | Mock, Jira, Plane, and GitHub Issues tracker adapters normalize issues into one `Issue` model. |
 | Agents need isolated checkouts | Each issue gets a deterministic workspace under the configured workspace root. |
 | Prompts should live with the repo | `WORKFLOW.md` front matter config plus Markdown prompt body are parsed locally. |
 | Code changes need human review | Git changes can be committed, pushed, and opened as draft GitHub PRs. |
@@ -73,17 +78,19 @@ It solves a narrow automation problem:
 | Mock tracker | Yes | JSON file based |
 | Jira tracker | Yes | JQL fetch, issue normalization, PR comment, transition |
 | Plane tracker | Yes | Work-item fetch, normalization, PR comment, state transition |
-| Tracker registry | Yes | Mock, Jira, and Plane are registered through `src/trackers/registry.ts`; custom trackers can be added in code |
+| Tracker registry | Yes | Mock, Jira, Plane, and GitHub Issues are registered through `src/trackers/registry.ts`; custom trackers can be added in code |
+| GitHub Issues tracker | Yes | Fetches candidate issues by labels, comments, and applies a Human Review label |
 | Workspace creation | Yes | Safe path checks under configured root |
 | Git clone/branch prep | Yes | Clone or fetch existing repo; checkout issue branch |
 | Dry-run agent | Yes | Writes prompt log, does not modify repo |
 | Codex agent | Yes | Runs configured Codex command through a generic process runner |
-| Agent runner registry | Yes | DryRun and Codex are registered through `src/agents/registry.ts`; custom runners can be added in code |
-| Logs and timeout | Yes | Agent and PR commands capture logs; Codex runner supports timeout |
+| Shell agent | Yes | Generic trusted command runner with stdin/file prompt modes |
+| Agent runner registry | Yes | DryRun, Codex, and Shell are registered through `src/agents/registry.ts`; custom runners can be added in code |
+| Logs and timeout | Yes | Agent and PR commands capture logs; Codex and Shell runners support timeout |
 | Draft GitHub PR creation | Yes | Uses `gh pr create --draft`; never merges |
 | Docker Compose runtime | Yes | Runs the existing CLI with mounted config/workspaces/logs; no public ports |
 | Long-running daemon | Yes | Polls the configured tracker until stopped |
-| Retry/reconciliation state | Yes | In-memory attempt state with cooldown, max attempts, and candidate-state checks |
+| Retry/reconciliation state | Yes | Memory store for local/dev; Postgres store for durable production state, cooldown, max attempts, candidate-state checks, stale-run recovery, and locks |
 | Dashboard/status UI | Yes | Minimal local-only HTTP dashboard for daemon mode when enabled |
 | Auto-merge | Not planned | Explicitly out of scope |
 
@@ -91,7 +98,7 @@ It solves a narrow automation problem:
 
 ```mermaid
 flowchart LR
-    A[Issue Tracker<br/>Mock / Jira / Plane / Custom] --> R[Tracker Registry]
+    A[Issue Tracker<br/>Mock / Jira / Plane / GitHub Issues / Custom] --> R[Tracker Registry]
     R --> B[TrackerAdapter]
     B --> C[Normalized Issue Model]
     C --> D[CLI Orchestration<br/>validate / dry-run / run / daemon]
@@ -101,7 +108,7 @@ flowchart LR
     E --> F[GitService<br/>clone / branch]
     F --> G[Prompt Renderer<br/>WORKFLOW.md]
     G --> AR[Agent Runner Registry]
-    AR --> H[AgentRunner<br/>DryRun / Codex / Custom]
+    AR --> H[AgentRunner<br/>DryRun / Codex / Shell / Custom]
     H --> I[GitHubPullRequestService<br/>commit / push / draft PR]
     I --> J[Tracker Writeback<br/>comment + Human Review]
     D --> L[DashboardStatusStore]
@@ -116,7 +123,7 @@ Core abstractions:
 | `TrackerAdapter` | Fetch work items and optionally write PR comments / transitions. |
 | `Orchestrator` | Runs one polling cycle over eligible issues. |
 | `PollingDaemon` | Repeats orchestrator cycles at a configured interval until stopped. |
-| `RunStateStore` | Stores attempt state; currently implemented in memory. |
+| `RunStateStore` | Stores attempt state; implemented with memory and Postgres backends. |
 | `DashboardStatusStore` | Maintains redacted daemon status for the local dashboard API. |
 | `WorkspaceManager` | Create safe per-issue workspace paths. |
 | `GitService` | Clone/fetch repositories and prepare branches. |
@@ -138,9 +145,9 @@ src/
   github/       Draft pull request creation through gh
   logging/      Secret redaction
   orchestrator/ One-shot orchestration cycle shared by run and daemon
-  state/        RunStateStore interface and in-memory implementation
+  state/        RunStateStore interface, in-memory store, Postgres store, and migrations
   templates/    Prompt rendering
-  trackers/     Tracker registry plus Mock, Jira, and Plane adapters
+  trackers/     Tracker registry plus Mock, Jira, Plane, and GitHub Issues adapters
   workflow/     WORKFLOW.md parser and schema validation
   workspaces/   Safe path validation and workspace creation
 
@@ -151,8 +158,11 @@ examples/
   WORKFLOW.mock.example.md
   WORKFLOW.dashboard.mock.example.md
   WORKFLOW.docker.mock.example.md
+  WORKFLOW.github-issues.example.md
   WORKFLOW.jira.example.md
   WORKFLOW.plane.example.md
+  WORKFLOW.postgres.mock.example.md
+  WORKFLOW.shell-agent.example.md
   mock-issues.json
 
 tests/
@@ -168,13 +178,14 @@ tests/
 - For draft GitHub PR creation: `gh` CLI authenticated for the target repository
 - For Jira: Jira Cloud base URL, email, and API token
 - For Plane: Plane API base URL and API key
+- For Postgres-backed state outside Docker: a reachable Postgres database and `psql` client on `PATH`
 - For Docker runtime: Docker Engine and Docker Compose
 
 > [!NOTE]
 > Unit tests mock Jira, Plane, GitHub PR process execution, and Codex process execution. They do not
 > require real external credentials.
 
-### Quick Start
+### Local Mock Quick Start
 
 ```bash
 npm install
@@ -202,6 +213,13 @@ http://127.0.0.1:4000
 
 With the checked-in mock example, the dry-run agent does not change files, so PR creation is skipped
 with `skippedReason: "no_changes"`.
+
+The same flow can be checked without running a long-lived process:
+
+```bash
+npm run validate:examples
+npm run daemon:mock:once
+```
 
 ### Docker Runtime
 
@@ -278,6 +296,7 @@ Mounted volumes:
 | `./config` | `/config` | Workflow files and non-secret configuration files. Mounted read-only. |
 | `./workspaces` | `/workspaces` | Per-issue cloned repositories and working trees. |
 | `./logs` | `/logs` | Agent, GitHub PR, and command logs. |
+| `postgres-data` | `/var/lib/postgresql/data` | Docker named volume for local Postgres state. |
 
 Environment variables:
 
@@ -288,6 +307,8 @@ Environment variables:
 | `PLANE_API_KEY` | Plane tracker authentication |
 | `GH_TOKEN` or `GITHUB_TOKEN` | GitHub CLI authentication |
 | `OPENAI_API_KEY` | Codex or model provider configuration, if needed |
+| `DATABASE_URL` | Postgres-backed run-state storage when `state.kind: postgres` |
+| `POSTGRES_PASSWORD` | Local Docker Compose Postgres password; default is development-only |
 
 See `examples/docker.env.example` for a non-secret template.
 
@@ -299,6 +320,7 @@ Docker limitations:
 
 - No public ports are exposed.
 - Docker Compose does not publish the dashboard port; keep any port mapping local-only if you add one.
+- Docker Compose includes a Postgres service bound to `127.0.0.1:5432` for local development. Change the password and secret handling for production.
 - The image includes Git and GitHub CLI for PR creation.
 - The image does not install the Codex CLI. For real `agent.kind: codex` runs, build a derived image
   that installs `codex`, or set `agent.command` to an executable available in the container.
@@ -317,8 +339,15 @@ Copy-pasteable examples:
 | `examples/WORKFLOW.mock.example.md` | Basic mock tracker example. | No |
 | `examples/WORKFLOW.dashboard.mock.example.md` | Mock daemon with local dashboard enabled. | No |
 | `examples/WORKFLOW.docker.mock.example.md` | Docker Compose mock workflow using `/config`, `/workspaces`, and `/logs`. | No |
+| `examples/WORKFLOW.github-issues.example.md` | GitHub Issues + Codex example. | Requires GitHub/Codex environment. |
+| `examples/WORKFLOW.postgres.mock.example.md` | Mock workflow using Postgres-backed run state. | Requires `DATABASE_URL` |
+| `examples/WORKFLOW.shell-agent.example.md` | Mock workflow using the generic Shell runner. | No for `validate` and `dry-run`; `run` executes `cat`. |
 | `examples/WORKFLOW.jira.example.md` | Jira + Codex example. | Requires Jira/Codex/GitHub environment. |
 | `examples/WORKFLOW.plane.example.md` | Plane + Codex example. | Requires Plane/Codex/GitHub environment. |
+
+> [!NOTE]
+> SQLite is not implemented in this repository, so there is intentionally no
+> `examples/WORKFLOW.sqlite.example.md`.
 
 Minimal mock shape:
 
@@ -328,6 +357,8 @@ version: 1
 tracker:
   kind: mock
   issue_file: ./mock-issues.json
+state:
+  kind: memory
 workspace:
   root: ../.symphony/workspaces
 repository:
@@ -370,11 +401,17 @@ Implement {{issue.identifier}}: {{issue.title}}
 
 Supported tracker kinds:
 
-| Tracker | Required config |
-| --- | --- |
-| `mock` | `issue_file` |
-| `jira` | `base_url`, `email`, `api_token`, `jql`; optional `max_results`, `review_transition` |
-| `plane` | `base_url`, `api_key`, `workspace_slug`, `project_id`; optional `max_results`, `review_state` |
+| Tracker | Status | Candidate selection | Comments | Transition |
+| --- | --- | --- | --- | --- |
+| Mock | Implemented | JSON/mock data filtered by `states.active` | No | No |
+| Jira | Implemented | JQL | Yes | Jira transition to Human Review |
+| Plane | Implemented | Project work items filtered by `states.active` | Yes | Plane state change to Human Review |
+| GitHub Issues | Implemented | Labels plus `states.active` | Yes | Adds Human Review label; can remove candidate labels |
+
+Tracker capability requirements can be declared with optional fields such as
+`tracker.require_comment`, `tracker.require_transition`, `tracker.require_fetch_by_query`, and
+`tracker.require_fetch_by_label`. The orchestrator fails during startup if the selected adapter does
+not support a required capability.
 
 Custom tracker kinds are supported through the tracker registry. They are not available from config
 alone; the tracker must be implemented and registered in TypeScript first. See
@@ -382,10 +419,28 @@ alone; the tracker must be implemented and registered in TypeScript first. See
 
 Supported agent kinds:
 
-| Agent | Behavior |
-| --- | --- |
-| `dry-run` | Writes the rendered prompt to a log and exits successfully. |
-| `codex` | Runs configured `command` and `args`, sends the rendered prompt on stdin, captures stdout/stderr, and enforces `timeout_seconds`. |
+| Agent Runner | Status | Prompt mode | Notes |
+| --- | --- | --- | --- |
+| DryRun | Implemented | Internal | No external execution; intentionally writes a redacted prompt log. |
+| Codex | Implemented | stdin | First concrete coding-agent runner; runs configured command/args in the repo workspace. |
+| Shell | Implemented | stdin/file | Generic trusted command runner for custom agents, Claude Code, Aider, Cursor CLI, or internal scripts. |
+
+Shell runner example:
+
+```yaml
+agent:
+  kind: shell
+  command: "my-agent --non-interactive"
+  timeout_minutes: 60
+  prompt_mode: stdin
+  save_prompt: false
+  env:
+    AGENT_MODE: coding
+```
+
+> [!WARNING]
+> Agent runners execute commands in workspaces. Only use trusted commands, least-privilege
+> credentials, and isolated environments.
 
 Custom agent kinds are supported through the agent runner registry. They are not available from
 config alone; the runner must be implemented and registered in TypeScript first. See
@@ -396,6 +451,38 @@ Daemon configuration:
 | Field | Default | Behavior |
 | --- | --- | --- |
 | `daemon.poll_interval_seconds` | `60` | Wait time between polling cycles. Must be at least `1`. |
+
+State storage configuration:
+
+| Field | Default | Behavior |
+| --- | --- | --- |
+| `state.kind` | `memory` | `memory` is for tests, quick starts, and local development. `postgres` is recommended for daemon/server production use. |
+| `state.connection_string` | Required for Postgres | Supports `${DATABASE_URL}` interpolation. The CLI and dashboard redact it. |
+| `state.lock_ttl_seconds` | `900` | Lease duration used by the Postgres store to prevent duplicate active runs. |
+
+Postgres example:
+
+```yaml
+state:
+  kind: postgres
+  connection_string: ${DATABASE_URL}
+  lock_ttl_seconds: 900
+
+retry:
+  max_attempts: 2
+  failure_cooldown_seconds: 300
+```
+
+Production recommendation:
+
+```bash
+export DATABASE_URL='postgres://orchestrator:change-me@localhost:5432/orchestrator'
+```
+
+> [!NOTE]
+> The in-memory store is intentionally kept for unit tests and fast local experiments. It does not
+> survive process restarts. Use Postgres for daemon mode when retry history and duplicate prevention
+> need to survive restarts.
 
 Retry and reconciliation configuration:
 
@@ -413,7 +500,7 @@ Run states:
 discovered -> queued -> preparing_workspace -> running_agent -> creating_pr
   -> commenting_tracker -> transitioning_tracker -> succeeded
 
-Other terminal states: failed, skipped, needs_human_attention, cancelled
+Other terminal states: failed_retryable, failed_terminal, needs_human_attention, cancelled
 ```
 
 Dashboard configuration:
@@ -471,9 +558,12 @@ The npm scripts wrap build plus selected CLI commands:
 
 ```bash
 npm run validate:mock
+npm run validate:examples
 npm run dry-run:mock
+npm run daemon:mock:once
 npm run daemon:mock
 npm run docker:build
+npm run docker:validate
 npm run docker:dry-run
 ```
 
@@ -504,15 +594,54 @@ Important details:
 
 - `run` processes up to `limits.max_concurrency`, currently validated to `1`.
 - `daemon` reuses the same one-shot orchestration cycle and waits `daemon.poll_interval_seconds` between polls.
-- `daemon` keeps in-memory run state and applies retry/reconciliation rules across polling cycles.
+- `daemon` uses the configured run-state store and applies retry/reconciliation rules across polling cycles.
+- On startup, daemon mode marks stale unfinished active runs as `failed_retryable` or `needs_human_attention`, clears expired locks, and skips those recovered issues for the first poll cycle.
 - Retry respects candidate tracker state, cooldown, max attempts, retryable error codes, existing PR URLs, and prior success.
+- Postgres state uses a unique `(tracker_kind, tracker_issue_id)` index plus a lightweight lock lease to avoid duplicate active runs.
 - Reconciliation updates latest tracker state, skips non-candidate issues that are not running, and warns if a running issue moved to a terminal tracker state.
 - Workspaces are not deleted automatically.
 - PRs are always draft PRs.
 - The code never calls `gh pr merge` or `git merge`.
 - Tracker writeback happens only after a PR URL exists.
 
-### Extending the Project
+### Production Readiness
+
+The current implementation is suitable for local mock flows and for controlled production pilots
+when the runtime dependencies are provided explicitly.
+
+| Area | Production status |
+| --- | --- |
+| Persistent state | Use `state.kind: postgres`; memory state is local/dev only. |
+| Duplicate prevention | Postgres state uses a unique tracker issue index and lock lease fields. |
+| Restart recovery | Daemon startup marks stale unfinished runs and skips them on the first recovered poll. |
+| Dashboard | Local-only by default; keep it bound to `127.0.0.1` or `localhost`. |
+| Tracker writes | Jira, Plane, and GitHub Issues writebacks happen only after a PR URL exists. |
+| Agent execution | Shell and Codex execute trusted commands in workspaces; isolate credentials and hosts. |
+| PR lifecycle | Draft PR creation only; no merge command exists. |
+
+### State Persistence
+
+Memory state remains the default for tests, quick starts, and experimentation. It does not survive
+process restarts and should not be used for long-running production daemon mode.
+
+Postgres is the recommended production store:
+
+```yaml
+state:
+  kind: postgres
+  connection_string: ${DATABASE_URL}
+  lock_ttl_seconds: 900
+```
+
+```bash
+export DATABASE_URL='postgres://orchestrator:change-me@localhost:5432/orchestrator'
+```
+
+The Postgres store runs idempotent migrations on startup, stores retry/reconciliation state, and
+uses lock fields designed for future multi-worker operation. The current implementation uses the
+`psql` client process instead of a Node database driver.
+
+### Adding Trackers
 
 Add a new tracker:
 
@@ -525,6 +654,8 @@ Add a new tracker:
 
 See [`docs/ADDING_TRACKERS.md`](docs/ADDING_TRACKERS.md) and
 [`examples/ExampleTrackerAdapter.ts`](examples/ExampleTrackerAdapter.ts) for the full pattern.
+
+### Adding Agent Runners
 
 Add a new agent runner:
 
@@ -549,9 +680,23 @@ Implemented safety constraints:
 - `github.draft` must be `true`.
 - Max concurrency is currently restricted to `1`.
 - No auto-merge behavior exists.
-- Jira and Plane writeback occurs only after draft PR creation returns a URL.
+- Jira, Plane, and GitHub Issues writeback occurs only after draft PR creation returns a URL.
 - Issues marked `needs_human_attention` receive a tracker comment when the tracker supports comments.
-- Run state persistence is in memory only; restarting the process clears retry history.
+- External reconciliation is local-first: startup recovery preserves internal state, but does not yet verify remote GitHub PR or tracker transitions after restart.
+- The current Postgres backend uses the `psql` client process instead of a Node database driver because no additional package dependency is currently available in this repo.
+
+### Safety Checklist
+
+Before running against real Jira, Plane, GitHub Issues, Codex, or Shell commands:
+
+- Run `npm run validate:mock` and `npm run dry-run:mock`.
+- Validate the real workflow with required environment variables set.
+- Use `state.kind: postgres` for daemon mode.
+- Keep `dashboard.host` as `127.0.0.1` or `localhost`.
+- Use least-privilege API tokens and do not commit secrets.
+- Confirm `github.draft: true`.
+- Run agents in isolated workspaces and trusted environments.
+- Review draft PRs manually; there is no auto-merge path.
 
 ### Tests
 
@@ -567,11 +712,13 @@ Current test coverage includes:
 - Mock tracker
 - Jira tracker HTTP behavior and normalization
 - Plane tracker HTTP behavior and normalization
+- GitHub Issues tracker HTTP behavior, normalization, comments, and Human Review labels
 - Workspace path safety
 - Git clone/branch behavior with a local repository
-- Dry-run and Codex runner behavior with mocked process execution
+- Dry-run, Codex, and Shell runner behavior with mocked process execution
 - Draft GitHub PR command flow with mocked process execution
 - Daemon polling and in-memory run state behavior
+- Memory and Postgres run-state serialization, migrations, retry listing, stale-run recovery, and locks
 - Dashboard status serialization and redacted config summary
 - Dashboard API endpoints when localhost binding is available
 - Retry cooldown, max attempts, non-retryable errors, candidate-state reconciliation, existing PR prevention, human-attention state, and duplicate active run prevention
@@ -582,9 +729,8 @@ Current test coverage includes:
 
 Planned, not currently implemented:
 
-- Persistent retry/reconciliation state
-- Additional production tracker adapters beyond Mock/Jira/Plane
-- Additional production agent runners beyond DryRun/Codex
+- Deeper external reconciliation against GitHub and tracker APIs after restart
+- More hosted state backends beyond Postgres
 
 Not planned:
 
@@ -599,16 +745,20 @@ Not planned:
 - [项目概览](#项目概览)
 - [当前功能矩阵](#当前功能矩阵)
 - [架构](#架构)
-- [本地运行](#本地运行)
+- [本地 Mock 快速开始](#本地-mock-快速开始)
 - [Docker 运行方式](#docker-运行方式)
 - [配置与命令](#配置与命令)
-- [扩展方式](#扩展方式)
+- [生产就绪性](#生产就绪性)
+- [状态持久化](#状态持久化)
+- [新增 Tracker](#新增-tracker)
+- [新增 Agent Runner](#新增-agent-runner)
 - [安全边界](#安全边界)
+- [安全检查清单](#安全检查清单)
 - [路线图](#路线图)
 
 ### 项目概览
 
-Owned Symphony 是一个受 OpenAI Symphony 启发、但由本仓库自行实现的 TypeScript CLI 编排器。它的目标是把 Jira、Plane 或 Mock tracker 中的工作项，转成隔离的 coding-agent 执行流程：读取符合条件的 issue，创建独立 workspace，克隆目标仓库，使用 `WORKFLOW.md` 渲染 prompt，运行 DryRun 或 Codex agent，并在有代码变更时创建 GitHub draft PR 供人工审查。
+Owned Symphony 是一个受 OpenAI Symphony 启发、但由本仓库自行实现的 TypeScript CLI 编排器。它的目标是把 Jira、Plane、GitHub Issues 或 Mock tracker 中的工作项，转成隔离的 coding-agent 执行流程：读取符合条件的 issue，创建独立 workspace，克隆目标仓库，使用 `WORKFLOW.md` 渲染 prompt，运行 DryRun 或 Codex agent，并在有代码变更时创建 GitHub draft PR 供人工审查。
 
 > [!IMPORTANT]
 > 本项目不是 OpenAI Symphony 参考实现的封装。`SPEC.md` 仅作为架构参考。
@@ -622,16 +772,18 @@ Owned Symphony 是一个受 OpenAI Symphony 启发、但由本仓库自行实现
 | Mock tracker | 已实现 | 读取本地 JSON issue |
 | Jira adapter | 已实现 | JQL 获取、标准化、评论、流转到 Human Review |
 | Plane adapter | 已实现 | work-item 获取、标准化、评论、流转到 Human Review |
-| Tracker registry | 已实现 | Mock、Jira、Plane 通过 `src/trackers/registry.ts` 注册；自定义 tracker 需要代码接入 |
+| Tracker registry | 已实现 | Mock、Jira、Plane、GitHub Issues 通过 `src/trackers/registry.ts` 注册；自定义 tracker 需要代码接入 |
+| GitHub Issues tracker | 已实现 | 按 label 获取候选 issue、评论，并添加 Human Review label |
 | Workspace | 已实现 | 每个 issue 一个安全路径 |
 | Git | 已实现 | clone/fetch、创建 issue branch |
 | DryRunRunner | 已实现 | 写 prompt log，不修改代码 |
 | CodexRunner | 已实现 | 调用配置的 Codex 命令，支持 timeout 和日志 |
-| Agent runner registry | 已实现 | DryRun、Codex 通过 `src/agents/registry.ts` 注册；自定义 runner 需要代码接入 |
+| ShellRunner | 已实现 | 通用可信命令 runner，支持 stdin/file prompt mode |
+| Agent runner registry | 已实现 | DryRun、Codex、Shell 通过 `src/agents/registry.ts` 注册；自定义 runner 需要代码接入 |
 | GitHub draft PR | 已实现 | 通过 `gh` 检测变更、commit、push、创建 draft PR |
 | Docker Compose runtime | 已实现 | 运行现有 CLI，挂载 config/workspaces/logs，不暴露端口 |
 | 后台 daemon | 已实现 | 按间隔轮询 tracker |
-| Retry / reconciliation state | 已实现 | 内存 attempt state，支持 cooldown、最大尝试次数和 candidate-state 检查 |
+| Retry / reconciliation state | 已实现 | 本地/测试可用内存 store；生产可用 Postgres store，支持 cooldown、最大尝试次数、candidate-state 检查、启动恢复和锁 |
 | Dashboard / status UI | 已实现 | daemon 模式下可选启用的本地 HTTP 状态页 |
 | 自动 merge | 不计划 | 明确不会实现 |
 
@@ -639,7 +791,7 @@ Owned Symphony 是一个受 OpenAI Symphony 启发、但由本仓库自行实现
 
 ```mermaid
 flowchart LR
-    A[Issue Tracker<br/>Mock / Jira / Plane / Custom] --> R[Tracker Registry]
+    A[Issue Tracker<br/>Mock / Jira / Plane / GitHub Issues / Custom] --> R[Tracker Registry]
     R --> B[TrackerAdapter]
     B --> C[统一 Issue 模型]
     C --> D[CLI 编排<br/>validate / dry-run / run / daemon]
@@ -649,7 +801,7 @@ flowchart LR
     E --> F[GitService<br/>clone / branch]
     F --> G[Prompt Renderer<br/>WORKFLOW.md]
     G --> AR[Agent Runner Registry]
-    AR --> H[AgentRunner<br/>DryRun / Codex / Custom]
+    AR --> H[AgentRunner<br/>DryRun / Codex / Shell / Custom]
     H --> I[GitHubPullRequestService<br/>commit / push / draft PR]
     I --> J[Tracker 回写<br/>评论 + Human Review]
     D --> L[DashboardStatusStore]
@@ -663,7 +815,7 @@ flowchart LR
 | `TrackerAdapter` | 获取工作项，并在支持时写入 PR 评论和状态流转。 |
 | `Orchestrator` | 执行一次轮询和 issue 处理周期。 |
 | `PollingDaemon` | 按配置间隔重复执行 Orchestrator 周期，直到进程停止。 |
-| `RunStateStore` | 保存 attempt state；当前实现为内存存储。 |
+| `RunStateStore` | 保存 attempt state；已实现内存和 Postgres 后端。 |
 | `DashboardStatusStore` | 为本地 dashboard API 保存脱敏后的 daemon 状态。 |
 | `WorkspaceManager` | 创建受控的 per-issue workspace。 |
 | `GitService` | 克隆或更新仓库，并创建分支。 |
@@ -671,7 +823,7 @@ flowchart LR
 | `AgentRunner` | 抽象 DryRun 和 Codex 等 agent。 |
 | `GitHubPullRequestService` | 检测变更、commit、push、创建 draft PR。 |
 
-### 本地运行
+### 本地 Mock 快速开始
 
 ```bash
 npm install
@@ -700,6 +852,13 @@ http://127.0.0.1:4000
 > [!NOTE]
 > Mock 示例使用 `dry-run` agent，不会修改代码；因此通常会跳过 PR 创建，并返回
 > `skippedReason: "no_changes"`。
+
+不启动长驻进程时，也可以运行：
+
+```bash
+npm run validate:examples
+npm run daemon:mock:once
+```
 
 ### Docker 运行方式
 
@@ -766,6 +925,7 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 | `./config` | `/config` | workflow 和非秘密配置；只读挂载。 |
 | `./workspaces` | `/workspaces` | 每个 issue 的 clone 仓库和工作目录。 |
 | `./logs` | `/logs` | agent、GitHub PR 和命令日志。 |
+| `postgres-data` | `/var/lib/postgresql/data` | 本地 Docker Postgres 状态的 named volume。 |
 
 环境变量：
 
@@ -776,6 +936,8 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 | `PLANE_API_KEY` | Plane tracker 认证 |
 | `GH_TOKEN` 或 `GITHUB_TOKEN` | GitHub CLI 认证 |
 | `OPENAI_API_KEY` | Codex 或模型提供商配置，如需要 |
+| `DATABASE_URL` | `state.kind: postgres` 时的 Postgres run-state 连接串 |
+| `POSTGRES_PASSWORD` | 本地 Docker Compose Postgres 密码；默认值只适合开发 |
 
 > [!WARNING]
 > 不要把 secret 写入镜像。请通过环境变量、`.env` 或运行时 secret manager 注入。
@@ -784,6 +946,7 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 
 - 不暴露任何公共端口。
 - Docker Compose 默认不发布 dashboard 端口；如需映射，请保持本机-only。
+- Docker Compose 包含 Postgres 服务，并仅绑定到 `127.0.0.1:5432`；生产环境请替换默认密码和 secret 管理方式。
 - 镜像包含 Git 和 GitHub CLI。
 - 镜像不安装 Codex CLI；真实 `agent.kind: codex` 运行需要派生镜像或容器内可用的 `agent.command`。
 - 不会默认删除 workspaces。
@@ -796,21 +959,43 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 - `examples/WORKFLOW.mock.example.md`
 - `examples/WORKFLOW.dashboard.mock.example.md`
 - `examples/WORKFLOW.docker.mock.example.md`
+- `examples/WORKFLOW.github-issues.example.md`
+- `examples/WORKFLOW.postgres.mock.example.md`
+- `examples/WORKFLOW.shell-agent.example.md`
 - `examples/WORKFLOW.jira.example.md`
 - `examples/WORKFLOW.plane.example.md`
 
+> [!NOTE]
+> 本仓库未实现 SQLite state store，因此不会提供 `examples/WORKFLOW.sqlite.example.md`。
+
 支持的 tracker：
 
-| Tracker | 必填配置 |
-| --- | --- |
-| `mock` | `issue_file` |
-| `jira` | `base_url`、`email`、`api_token`、`jql` |
-| `plane` | `base_url`、`api_key`、`workspace_slug`、`project_id` |
+| Tracker | 状态 | 候选选择 | 评论 | 流转 |
+| --- | --- | --- | --- | --- |
+| Mock | 已实现 | JSON/mock data，再由 `states.active` 过滤 | 否 | 否 |
+| Jira | 已实现 | JQL | 是 | Jira transition 到 Human Review |
+| Plane | 已实现 | project work items，再由 `states.active` 过滤 | 是 | Plane state 改为 Human Review |
+| GitHub Issues | 已实现 | labels + `states.active` | 是 | 添加 Human Review label；可移除候选 label |
+
+可以用 `tracker.require_comment`、`tracker.require_transition`、
+`tracker.require_fetch_by_query`、`tracker.require_fetch_by_label` 声明能力要求。若所选 adapter
+不支持必需能力，orchestrator 会在启动时失败并给出明确错误。
 
 自定义 tracker kind 需要先在 TypeScript 中实现并注册，不能只靠配置启用。完整模式见
 [`docs/ADDING_TRACKERS.md`](docs/ADDING_TRACKERS.md)，示例模板见
 [`examples/ExampleTrackerAdapter.ts`](examples/ExampleTrackerAdapter.ts)。占位 tracker 配置仅保留在文档片段中；
 `examples/WORKFLOW*.md` 应保持可校验。
+
+支持的 agent runner：
+
+| Agent Runner | 状态 | Prompt mode | 说明 |
+| --- | --- | --- | --- |
+| DryRun | 已实现 | Internal | 不执行外部命令；用于预览并写入脱敏 prompt log。 |
+| Codex | 已实现 | stdin | 第一个具体 coding-agent runner；在 repo workspace 中运行配置的 command/args。 |
+| Shell | 已实现 | stdin/file | 面向自定义 agent、Claude Code、Aider、Cursor CLI 或内部脚本的通用可信命令 runner。 |
+
+> [!WARNING]
+> Agent runner 会在 workspace 中执行命令。只使用可信命令、最小权限凭证和隔离环境。
 
 自定义 agent kind 也需要先在 TypeScript 中实现并注册，不能只靠配置启用。完整模式见
 [`docs/ADDING_AGENT_RUNNERS.md`](docs/ADDING_AGENT_RUNNERS.md)，示例模板见
@@ -821,6 +1006,30 @@ Daemon 配置：
 | 字段 | 默认值 | 行为 |
 | --- | --- | --- |
 | `daemon.poll_interval_seconds` | `60` | 每次轮询之间的等待秒数，必须至少为 `1`。 |
+
+State store 配置：
+
+| 字段 | 默认值 | 行为 |
+| --- | --- | --- |
+| `state.kind` | `memory` | `memory` 适合测试、quick start 和本地开发；daemon/server 生产环境建议使用 `postgres`。 |
+| `state.connection_string` | Postgres 必填 | 支持 `${DATABASE_URL}` 插值；CLI 和 dashboard 会脱敏。 |
+| `state.lock_ttl_seconds` | `900` | Postgres store 用于避免重复 active run 的 lease 时长。 |
+
+示例：
+
+```yaml
+state:
+  kind: postgres
+  connection_string: ${DATABASE_URL}
+  lock_ttl_seconds: 900
+
+retry:
+  max_attempts: 2
+  failure_cooldown_seconds: 300
+```
+
+> [!NOTE]
+> 内存 store 不会跨进程重启保存历史；需要持久化 retry 历史和重复运行防护时，请使用 Postgres。
 
 Retry / reconciliation 配置：
 
@@ -838,7 +1047,7 @@ Run state：
 discovered -> queued -> preparing_workspace -> running_agent -> creating_pr
   -> commenting_tracker -> transitioning_tracker -> succeeded
 
-其他终态：failed, skipped, needs_human_attention, cancelled
+其他终态：failed_retryable, failed_terminal, needs_human_attention, cancelled
 ```
 
 Dashboard 配置：
@@ -894,7 +1103,40 @@ Dashboard 不返回 API token、环境变量、原始 prompt 或原始 tracker p
 node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cycles 1
 ```
 
-### 扩展方式
+### 生产就绪性
+
+当前实现适合本地 Mock flow，也适合在明确提供运行时依赖的受控环境中试点生产使用。
+
+| 领域 | 生产建议 |
+| --- | --- |
+| 持久化状态 | daemon/server 模式使用 `state.kind: postgres`；memory 仅用于本地和测试。 |
+| 重复运行防护 | Postgres 使用 tracker issue 唯一索引和轻量 lock lease。 |
+| 重启恢复 | daemon 启动时会恢复 stale run，并在第一轮跳过这些 issue。 |
+| Dashboard | 默认只绑定本机；保持 `127.0.0.1` 或 `localhost`。 |
+| Tracker 回写 | Jira、Plane、GitHub Issues 只在已有 PR URL 后回写。 |
+| Agent 执行 | Shell 和 Codex 会在 workspace 中执行可信命令；请隔离凭证和主机。 |
+| PR 生命周期 | 只创建 draft PR；没有 merge 命令。 |
+
+### 状态持久化
+
+Memory state 是默认值，适合测试、quick start 和本地实验；它不会跨进程重启保存历史。
+生产 daemon 建议使用 Postgres：
+
+```yaml
+state:
+  kind: postgres
+  connection_string: ${DATABASE_URL}
+  lock_ttl_seconds: 900
+```
+
+```bash
+export DATABASE_URL='postgres://orchestrator:change-me@localhost:5432/orchestrator'
+```
+
+Postgres store 会在启动时运行幂等 migration，保存 retry/reconciliation state，并使用 lock
+字段为未来多 worker 运行做准备。当前实现通过 `psql` client 访问数据库，而不是 Node 数据库 driver。
+
+### 新增 Tracker
 
 新增 tracker：
 
@@ -906,6 +1148,8 @@ node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cyc
 6. 添加不依赖真实凭证的 mock 测试。
 
 新增 tracker 的完整说明见 [`docs/ADDING_TRACKERS.md`](docs/ADDING_TRACKERS.md)。
+
+### 新增 Agent Runner
 
 新增 agent runner：
 
@@ -929,19 +1173,34 @@ node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cyc
 - GitHub PR 必须是 draft。
 - 当前最大并发限制为 `1`。
 - 不存在自动 merge 功能。
-- 只有成功创建 PR URL 后，才会回写 Jira 或 Plane。
-- `daemon` 使用内存 run state，在轮询之间应用 retry / reconciliation 规则。
+- 只有成功创建 PR URL 后，才会回写 Jira、Plane 或 GitHub Issues。
+- `daemon` 使用配置的 run-state store，在轮询之间应用 retry / reconciliation 规则。
+- daemon 启动时会把未完成的 stale active run 标记为 `failed_retryable` 或 `needs_human_attention`，清理过期锁，并在第一轮轮询跳过这些已恢复的 issue。
 - Retry 会检查 tracker candidate state、cooldown、最大尝试次数、可重试错误码、已有 PR URL 和历史成功状态。
+- Postgres state 使用 `(tracker_kind, tracker_issue_id)` 唯一索引和轻量 lock lease 来避免重复 active run。
 - Reconciliation 会更新最新 tracker 状态；非 candidate 且未运行的 issue 会被跳过；运行中 issue 如果被 tracker 移到终态会打印警告。
 - `needs_human_attention` 会在 tracker 支持评论时写入说明。
-- 当前 run state 仅保存在内存中；进程重启会清空 retry 历史。
+- 当前启动恢复以本地状态为准；尚未在重启后主动向 GitHub 或 tracker 反查远端 PR/状态。
+
+### 安全检查清单
+
+连接真实 Jira、Plane、GitHub Issues、Codex 或 Shell 命令前：
+
+- 先运行 `npm run validate:mock` 和 `npm run dry-run:mock`。
+- 在设置好所需环境变量后校验真实 workflow。
+- daemon 模式使用 `state.kind: postgres`。
+- 保持 `dashboard.host` 为 `127.0.0.1` 或 `localhost`。
+- 使用最小权限 API token，不要提交 secret。
+- 确认 `github.draft: true`。
+- 在隔离 workspace 和可信环境中运行 agent。
+- 人工审查 draft PR；项目没有自动 merge 路径。
 
 ### 路线图
 
 计划中，尚未实现：
 
-- 持久化 retry / reconciliation 状态
-- 更多生产级 tracker adapter 和 agent runner
+- 重启后对 GitHub 和 tracker API 做更深的外部 reconciliation
+- Postgres 以外的 hosted state backend
 
 ---
 
@@ -952,16 +1211,20 @@ node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cyc
 - [專案概覽](#專案概覽)
 - [目前功能矩陣](#目前功能矩陣)
 - [架構](#架構-1)
-- [本機執行](#本機執行)
+- [本機 Mock 快速開始](#本機-mock-快速開始)
 - [Docker 執行方式](#docker-執行方式)
 - [設定與命令](#設定與命令)
-- [擴充方式](#擴充方式)
+- [生產就緒性](#生產就緒性)
+- [狀態持久化](#狀態持久化)
+- [新增 Tracker](#新增-tracker-1)
+- [新增 Agent Runner](#新增-agent-runner-1)
 - [安全邊界](#安全邊界)
+- [安全檢查清單](#安全檢查清單)
 - [路線圖](#路線圖)
 
 ### 專案概覽
 
-Owned Symphony 是一個受 OpenAI Symphony 啟發、但由本儲存庫自行實作的 TypeScript CLI 編排器。它會把 Jira、Plane 或 Mock tracker 中符合條件的工作項，轉成隔離的 coding-agent 執行流程：讀取 issue、建立獨立 workspace、clone 目標 repo、使用 `WORKFLOW.md` 渲染 prompt、執行 DryRun 或 Codex agent，並在有程式碼變更時建立 GitHub draft PR 供人工審查。
+Owned Symphony 是一個受 OpenAI Symphony 啟發、但由本儲存庫自行實作的 TypeScript CLI 編排器。它會把 Jira、Plane、GitHub Issues 或 Mock tracker 中符合條件的工作項，轉成隔離的 coding-agent 執行流程：讀取 issue、建立獨立 workspace、clone 目標 repo、使用 `WORKFLOW.md` 渲染 prompt、執行 DryRun 或 Codex agent，並在有程式碼變更時建立 GitHub draft PR 供人工審查。
 
 > [!IMPORTANT]
 > 本專案不是 OpenAI Symphony 參考實作的包裝。`SPEC.md` 只作為架構參考。
@@ -975,16 +1238,18 @@ Owned Symphony 是一個受 OpenAI Symphony 啟發、但由本儲存庫自行實
 | Mock tracker | 已實作 | 讀取本機 JSON issue |
 | Jira adapter | 已實作 | JQL 取得、標準化、留言、流轉到 Human Review |
 | Plane adapter | 已實作 | work-item 取得、標準化、留言、流轉到 Human Review |
-| Tracker registry | 已實作 | Mock、Jira、Plane 透過 `src/trackers/registry.ts` 註冊；自訂 tracker 需要程式碼接入 |
+| Tracker registry | 已實作 | Mock、Jira、Plane、GitHub Issues 透過 `src/trackers/registry.ts` 註冊；自訂 tracker 需要程式碼接入 |
+| GitHub Issues tracker | 已實作 | 依 label 取得候選 issue、留言，並加入 Human Review label |
 | Workspace | 已實作 | 每個 issue 一個安全路徑 |
 | Git | 已實作 | clone/fetch、建立 issue branch |
 | DryRunRunner | 已實作 | 寫入 prompt log，不修改程式碼 |
 | CodexRunner | 已實作 | 呼叫設定的 Codex 命令，支援 timeout 和 logs |
-| Agent runner registry | 已實作 | DryRun、Codex 透過 `src/agents/registry.ts` 註冊；自訂 runner 需要程式碼接入 |
+| ShellRunner | 已實作 | 通用可信命令 runner，支援 stdin/file prompt mode |
+| Agent runner registry | 已實作 | DryRun、Codex、Shell 透過 `src/agents/registry.ts` 註冊；自訂 runner 需要程式碼接入 |
 | GitHub draft PR | 已實作 | 透過 `gh` 偵測變更、commit、push、建立 draft PR |
 | Docker Compose runtime | 已實作 | 執行現有 CLI，掛載 config/workspaces/logs，不暴露連接埠 |
 | 常駐 daemon | 已實作 | 依間隔輪詢 tracker |
-| Retry / reconciliation state | 已實作 | 記憶體 attempt state，支援 cooldown、最大嘗試次數和 candidate-state 檢查 |
+| Retry / reconciliation state | 已實作 | 本機/測試可用記憶體 store；生產可用 Postgres store，支援 cooldown、最大嘗試次數、candidate-state 檢查、啟動恢復和鎖 |
 | Dashboard / status UI | 已實作 | daemon 模式下可選啟用的本機 HTTP 狀態頁 |
 | 自動 merge | 不計畫 | 明確不支援 |
 
@@ -992,7 +1257,7 @@ Owned Symphony 是一個受 OpenAI Symphony 啟發、但由本儲存庫自行實
 
 ```mermaid
 flowchart LR
-    A[Issue Tracker<br/>Mock / Jira / Plane / Custom] --> R[Tracker Registry]
+    A[Issue Tracker<br/>Mock / Jira / Plane / GitHub Issues / Custom] --> R[Tracker Registry]
     R --> B[TrackerAdapter]
     B --> C[統一 Issue 模型]
     C --> D[CLI 編排<br/>validate / dry-run / run / daemon]
@@ -1002,7 +1267,7 @@ flowchart LR
     E --> F[GitService<br/>clone / branch]
     F --> G[Prompt Renderer<br/>WORKFLOW.md]
     G --> AR[Agent Runner Registry]
-    AR --> H[AgentRunner<br/>DryRun / Codex / Custom]
+    AR --> H[AgentRunner<br/>DryRun / Codex / Shell / Custom]
     H --> I[GitHubPullRequestService<br/>commit / push / draft PR]
     I --> J[Tracker 回寫<br/>留言 + Human Review]
     D --> L[DashboardStatusStore]
@@ -1016,7 +1281,7 @@ flowchart LR
 | `TrackerAdapter` | 取得工作項，並在支援時寫入 PR 留言和狀態流轉。 |
 | `Orchestrator` | 執行一次輪詢和 issue 處理週期。 |
 | `PollingDaemon` | 依設定間隔重複執行 Orchestrator 週期，直到程序停止。 |
-| `RunStateStore` | 保存 attempt state；目前實作為記憶體儲存。 |
+| `RunStateStore` | 保存 attempt state；已實作記憶體和 Postgres 後端。 |
 | `DashboardStatusStore` | 為本機 dashboard API 保存脫敏後的 daemon 狀態。 |
 | `WorkspaceManager` | 建立受控的 per-issue workspace。 |
 | `GitService` | clone 或更新 repo，並建立分支。 |
@@ -1024,7 +1289,7 @@ flowchart LR
 | `AgentRunner` | 抽象 DryRun 和 Codex 等 agent。 |
 | `GitHubPullRequestService` | 偵測變更、commit、push、建立 draft PR。 |
 
-### 本機執行
+### 本機 Mock 快速開始
 
 ```bash
 npm install
@@ -1053,6 +1318,13 @@ http://127.0.0.1:4000
 > [!NOTE]
 > Mock 範例使用 `dry-run` agent，不會修改程式碼；因此通常會略過 PR 建立，並回傳
 > `skippedReason: "no_changes"`。
+
+不啟動長駐程序時，也可以執行：
+
+```bash
+npm run validate:examples
+npm run daemon:mock:once
+```
 
 ### Docker 執行方式
 
@@ -1119,6 +1391,7 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 | `./config` | `/config` | workflow 和非秘密設定；唯讀掛載。 |
 | `./workspaces` | `/workspaces` | 每個 issue 的 clone repo 和工作目錄。 |
 | `./logs` | `/logs` | agent、GitHub PR 和命令 logs。 |
+| `postgres-data` | `/var/lib/postgresql/data` | 本機 Docker Postgres 狀態的 named volume。 |
 
 環境變數：
 
@@ -1129,6 +1402,8 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 | `PLANE_API_KEY` | Plane tracker 認證 |
 | `GH_TOKEN` 或 `GITHUB_TOKEN` | GitHub CLI 認證 |
 | `OPENAI_API_KEY` | Codex 或模型供應商設定，如需要 |
+| `DATABASE_URL` | `state.kind: postgres` 時的 Postgres run-state 連線字串 |
+| `POSTGRES_PASSWORD` | 本機 Docker Compose Postgres 密碼；預設值只適合開發 |
 
 > [!WARNING]
 > 不要把 secret 寫入映像檔。請透過環境變數、`.env` 或 runtime secret manager 注入。
@@ -1137,6 +1412,7 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 
 - 不暴露任何 public ports。
 - Docker Compose 預設不發布 dashboard port；如需映射，請保持本機-only。
+- Docker Compose 包含 Postgres 服務，並僅綁定到 `127.0.0.1:5432`；生產環境請替換預設密碼和 secret 管理方式。
 - 映像檔包含 Git 和 GitHub CLI。
 - 映像檔不安裝 Codex CLI；真實 `agent.kind: codex` 執行需要衍生映像檔或容器內可用的 `agent.command`。
 - 不會預設刪除 workspaces。
@@ -1149,21 +1425,43 @@ docker compose run --rm orchestrator daemon /config/WORKFLOW.md
 - `examples/WORKFLOW.mock.example.md`
 - `examples/WORKFLOW.dashboard.mock.example.md`
 - `examples/WORKFLOW.docker.mock.example.md`
+- `examples/WORKFLOW.github-issues.example.md`
+- `examples/WORKFLOW.postgres.mock.example.md`
+- `examples/WORKFLOW.shell-agent.example.md`
 - `examples/WORKFLOW.jira.example.md`
 - `examples/WORKFLOW.plane.example.md`
 
+> [!NOTE]
+> 本儲存庫未實作 SQLite state store，因此不會提供 `examples/WORKFLOW.sqlite.example.md`。
+
 支援的 tracker：
 
-| Tracker | 必填設定 |
-| --- | --- |
-| `mock` | `issue_file` |
-| `jira` | `base_url`、`email`、`api_token`、`jql` |
-| `plane` | `base_url`、`api_key`、`workspace_slug`、`project_id` |
+| Tracker | 狀態 | 候選選擇 | 留言 | 流轉 |
+| --- | --- | --- | --- | --- |
+| Mock | 已實作 | JSON/mock data，再由 `states.active` 過濾 | 否 | 否 |
+| Jira | 已實作 | JQL | 是 | Jira transition 到 Human Review |
+| Plane | 已實作 | project work items，再由 `states.active` 過濾 | 是 | Plane state 改為 Human Review |
+| GitHub Issues | 已實作 | labels + `states.active` | 是 | 加入 Human Review label；可移除候選 label |
+
+可以用 `tracker.require_comment`、`tracker.require_transition`、
+`tracker.require_fetch_by_query`、`tracker.require_fetch_by_label` 宣告能力要求。若所選 adapter
+不支援必要能力，orchestrator 會在啟動時失敗並給出明確錯誤。
 
 自訂 tracker kind 需要先在 TypeScript 中實作並註冊，不能只靠設定啟用。完整模式見
 [`docs/ADDING_TRACKERS.md`](docs/ADDING_TRACKERS.md)，範例模板見
 [`examples/ExampleTrackerAdapter.ts`](examples/ExampleTrackerAdapter.ts)。占位 tracker 設定只保留在文件片段中；
 `examples/WORKFLOW*.md` 應保持可校驗。
+
+支援的 agent runner：
+
+| Agent Runner | 狀態 | Prompt mode | 說明 |
+| --- | --- | --- | --- |
+| DryRun | 已實作 | Internal | 不執行外部命令；用於預覽並寫入脫敏 prompt log。 |
+| Codex | 已實作 | stdin | 第一個具體 coding-agent runner；在 repo workspace 中執行設定的 command/args。 |
+| Shell | 已實作 | stdin/file | 面向自訂 agent、Claude Code、Aider、Cursor CLI 或內部腳本的通用可信命令 runner。 |
+
+> [!WARNING]
+> Agent runner 會在 workspace 中執行命令。只使用可信命令、最小權限憑證和隔離環境。
 
 自訂 agent kind 也需要先在 TypeScript 中實作並註冊，不能只靠設定啟用。完整模式見
 [`docs/ADDING_AGENT_RUNNERS.md`](docs/ADDING_AGENT_RUNNERS.md)，範例模板見
@@ -1174,6 +1472,30 @@ Daemon 設定：
 | 欄位 | 預設值 | 行為 |
 | --- | --- | --- |
 | `daemon.poll_interval_seconds` | `60` | 每次輪詢之間的等待秒數，必須至少為 `1`。 |
+
+State store 設定：
+
+| 欄位 | 預設值 | 行為 |
+| --- | --- | --- |
+| `state.kind` | `memory` | `memory` 適合測試、quick start 和本機開發；daemon/server 生產環境建議使用 `postgres`。 |
+| `state.connection_string` | Postgres 必填 | 支援 `${DATABASE_URL}` 插值；CLI 和 dashboard 會脫敏。 |
+| `state.lock_ttl_seconds` | `900` | Postgres store 用於避免重複 active run 的 lease 時長。 |
+
+範例：
+
+```yaml
+state:
+  kind: postgres
+  connection_string: ${DATABASE_URL}
+  lock_ttl_seconds: 900
+
+retry:
+  max_attempts: 2
+  failure_cooldown_seconds: 300
+```
+
+> [!NOTE]
+> 記憶體 store 不會跨程序重啟保存歷史；需要持久化 retry 歷史和重複執行防護時，請使用 Postgres。
 
 Retry / reconciliation 設定：
 
@@ -1191,7 +1513,7 @@ Run state：
 discovered -> queued -> preparing_workspace -> running_agent -> creating_pr
   -> commenting_tracker -> transitioning_tracker -> succeeded
 
-其他終態：failed, skipped, needs_human_attention, cancelled
+其他終態：failed_retryable, failed_terminal, needs_human_attention, cancelled
 ```
 
 Dashboard 設定：
@@ -1247,7 +1569,40 @@ Dashboard 不回傳 API token、環境變數、原始 prompt 或原始 tracker p
 node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cycles 1
 ```
 
-### 擴充方式
+### 生產就緒性
+
+目前實作適合本機 Mock flow，也適合在明確提供 runtime dependencies 的受控環境中試行生產使用。
+
+| 領域 | 生產建議 |
+| --- | --- |
+| 持久化狀態 | daemon/server 模式使用 `state.kind: postgres`；memory 僅用於本機和測試。 |
+| 重複執行防護 | Postgres 使用 tracker issue 唯一索引和輕量 lock lease。 |
+| 重啟恢復 | daemon 啟動時會恢復 stale run，並在第一輪跳過這些 issue。 |
+| Dashboard | 預設只綁定本機；保持 `127.0.0.1` 或 `localhost`。 |
+| Tracker 回寫 | Jira、Plane、GitHub Issues 只在已有 PR URL 後回寫。 |
+| Agent 執行 | Shell 和 Codex 會在 workspace 中執行可信命令；請隔離憑證和主機。 |
+| PR 生命週期 | 只建立 draft PR；沒有 merge 命令。 |
+
+### 狀態持久化
+
+Memory state 是預設值，適合測試、quick start 和本機實驗；它不會跨程序重啟保存歷史。
+生產 daemon 建議使用 Postgres：
+
+```yaml
+state:
+  kind: postgres
+  connection_string: ${DATABASE_URL}
+  lock_ttl_seconds: 900
+```
+
+```bash
+export DATABASE_URL='postgres://orchestrator:change-me@localhost:5432/orchestrator'
+```
+
+Postgres store 會在啟動時執行冪等 migration，保存 retry/reconciliation state，並使用 lock
+欄位為未來多 worker 執行做準備。目前實作透過 `psql` client 存取資料庫，而不是 Node database driver。
+
+### 新增 Tracker
 
 新增 tracker：
 
@@ -1259,6 +1614,8 @@ node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cyc
 6. 加入不依賴真實憑證的 mock 測試。
 
 新增 tracker 的完整說明見 [`docs/ADDING_TRACKERS.md`](docs/ADDING_TRACKERS.md)。
+
+### 新增 Agent Runner
 
 新增 agent runner：
 
@@ -1282,19 +1639,34 @@ node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cyc
 - GitHub PR 必須是 draft。
 - 目前最大並行限制為 `1`。
 - 不存在自動 merge 功能。
-- 只有成功取得 PR URL 後，才會回寫 Jira 或 Plane。
-- `daemon` 使用記憶體 run state，在輪詢之間套用 retry / reconciliation 規則。
+- 只有成功取得 PR URL 後，才會回寫 Jira、Plane 或 GitHub Issues。
+- `daemon` 使用設定的 run-state store，在輪詢之間套用 retry / reconciliation 規則。
+- daemon 啟動時會把未完成的 stale active run 標記為 `failed_retryable` 或 `needs_human_attention`，清理過期鎖，並在第一輪輪詢跳過這些已恢復的 issue。
 - Retry 會檢查 tracker candidate state、cooldown、最大嘗試次數、可重試錯誤碼、已有 PR URL 和歷史成功狀態。
+- Postgres state 使用 `(tracker_kind, tracker_issue_id)` 唯一索引和輕量 lock lease 來避免重複 active run。
 - Reconciliation 會更新最新 tracker 狀態；非 candidate 且未執行中的 issue 會被跳過；執行中 issue 若被 tracker 移到終態會印出警告。
 - `needs_human_attention` 會在 tracker 支援留言時寫入說明。
-- 目前 run state 僅保存在記憶體中；程序重啟會清空 retry 歷史。
+- 目前啟動恢復以本機狀態為準；尚未在重啟後主動向 GitHub 或 tracker 反查遠端 PR/狀態。
+
+### 安全檢查清單
+
+連接真實 Jira、Plane、GitHub Issues、Codex 或 Shell 命令前：
+
+- 先執行 `npm run validate:mock` 和 `npm run dry-run:mock`。
+- 在設定好所需環境變數後校驗真實 workflow。
+- daemon 模式使用 `state.kind: postgres`。
+- 保持 `dashboard.host` 為 `127.0.0.1` 或 `localhost`。
+- 使用最小權限 API token，不要提交 secret。
+- 確認 `github.draft: true`。
+- 在隔離 workspace 和可信環境中執行 agent。
+- 人工審查 draft PR；專案沒有自動 merge 路徑。
 
 ### 路線圖
 
 Roadmap，尚未實作：
 
-- 持久化 retry / reconciliation 狀態
-- 更多生產級 tracker adapter 和 agent runner
+- 重啟後對 GitHub 和 tracker API 做更深的外部 reconciliation
+- Postgres 以外的 hosted state backend
 
 ---
 

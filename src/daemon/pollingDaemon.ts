@@ -36,6 +36,7 @@ export interface PollingDaemonOptions {
   pollIntervalMs: number;
   signal?: AbortSignal;
   maxCycles?: number;
+  firstCycleExcludeIssueIds?: ReadonlySet<string>;
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   logger?: (event: DaemonLogEvent) => void;
   onIssueStarted?: (issue: Issue) => void;
@@ -76,6 +77,7 @@ export class PollingDaemon {
 
       try {
         const result = await this.orchestrator.runOnce({
+          excludeIssueIds: cycle === 1 ? this.options.firstCycleExcludeIssueIds : undefined,
           onIssueStarted: this.options.onIssueStarted,
           onIssueCompleted: this.options.onIssueCompleted,
           onIssueFailed: this.options.onIssueFailed,

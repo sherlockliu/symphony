@@ -31,6 +31,7 @@ function config(root: string): WorkflowConfig {
     version: 1,
     workflowPath: path.join(root, "WORKFLOW.md"),
     tracker: { kind: "mock", issueFile: "/tmp/issues.json" },
+    state: { kind: "memory" },
     workspace: { root },
     repository: {
       url: "https://github.com/example/project.git",

@@ -7,6 +7,12 @@ import type { CodexAgentConfig } from "./registry.js";
 
 export class CodexRunner implements AgentRunner {
   readonly kind = "codex";
+  readonly capabilities = {
+    canEditFiles: true,
+    canRunCommands: true,
+    canCreateCommits: false,
+    canOpenPullRequests: false
+  };
 
   constructor(
     private readonly config: CodexAgentConfig,
@@ -27,11 +33,24 @@ export class CodexRunner implements AgentRunner {
     return {
       success: result.exitCode === 0 && !result.timedOut,
       runner: this.kind,
+      summary: result.timedOut
+        ? "Codex runner timed out."
+        : result.exitCode === 0
+          ? "Codex runner completed successfully."
+          : `Codex runner exited with ${result.exitCode ?? "unknown"}.`,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
       logPath,
+      logsPath: logPath,
       stdout: result.stdout,
-      stderr: result.stderr
+      stderr: result.stderr,
+      error: result.exitCode === 0 && !result.timedOut
+        ? undefined
+        : {
+            type: result.timedOut ? "agent_timeout" : "agent_failed",
+            message: result.timedOut ? "Codex runner timed out." : `Codex runner exited with ${result.exitCode ?? "unknown"}.`,
+            retryable: result.timedOut
+          }
     };
   }
 

@@ -1,147 +1,124 @@
 # Adding Trackers
 
-Owned Symphony keeps tracker-specific code behind `TrackerAdapter` and the tracker registry in
-`src/trackers/registry.ts`. The orchestrator core should only depend on `TrackerAdapter`, not on
-Jira, Plane, Mock, or future tracker clients directly.
-
-> [!NOTE]
-> The current normalized tracker model is `Issue` in `src/types.ts`. This document uses "tracked
-> issue" to mean an external tracker item after it has been normalized into that `Issue` shape.
+Owned Symphony keeps tracker-specific code behind `TrackerAdapter` and `TrackerRegistry`. The
+orchestrator core should only depend on the adapter contract, not on Jira, Plane, GitHub Issues, or
+future tracker clients directly.
 
 ---
 
 ## When To Add A Tracker
 
-Add a tracker adapter when a new issue system needs to feed candidate work into the orchestrator or
+Add a production tracker when a new issue system should feed candidate work into the orchestrator or
 receive writeback after a draft PR is created.
 
 Good candidates:
 
-- The system has a stable API for listing candidate issues.
-- The system exposes enough fields to build a useful `Issue.identifier`, `Issue.title`,
-  `Issue.description`, and `Issue.state`.
-- The target workflow has a clear candidate state and human-review state.
-- Authentication can be provided through environment variables or runtime secrets.
+- The API can list candidate issues by state, query, label, or another stable selector.
+- The payload includes enough data for `id`, `identifier`, `title`, and `state`.
+- Authentication can be provided through environment variables or a runtime secret manager.
+- The writeback behavior is safe: comment and move to human review, never auto-close or auto-merge.
 
-Do not add a tracker if a one-off JSON export through the Mock tracker is enough.
+Use the Mock tracker for one-off JSON imports.
 
 ---
 
 ## Adapter Contract
 
-Implement `TrackerAdapter`:
-
 ```ts
 export interface TrackerAdapter {
+  readonly capabilities?: TrackerCapabilities;
   listIssues(): Promise<Issue[]>;
+  fetchIssue?(id: string): Promise<Issue>;
   addPullRequestComment?(issue: Issue, prUrl: string): Promise<void>;
   addNeedsHumanAttentionComment?(issue: Issue, state: IssueRunState): Promise<void>;
   transitionToHumanReview?(issue: Issue): Promise<void>;
 }
 ```
 
-`listIssues()` should return the tracker items that Symphony is allowed to inspect. The orchestrator
-then filters those issues through `states.active` from `WORKFLOW.md`.
+`listIssues()` returns normalized tracker items. The orchestrator then filters those items through
+`states.active` from `WORKFLOW.md`.
 
 Optional write methods should be implemented only when the tracker supports safe mutation.
 
 ---
 
-## Normalize External Fields
+## Normalized Issue Model
 
-Every tracker must normalize its native payload into `Issue`:
+The normalized tracker model is `Issue` in `src/types.ts`; `TrackedIssue` is exported as the tracker
+contract name in `src/trackers/tracker.ts`.
 
-| `Issue` field | Guidance |
+| Field | Guidance |
 | --- | --- |
-| `id` | Stable external ID used for internal run state. |
-| `identifier` | Human-readable key, such as `PROJ-123`. |
+| `id` | Stable external ID used for durable run state. Include enough context to avoid collisions. |
+| `identifier` | Human-readable key, such as `PROJ-123` or `repo#42`. |
 | `title` | Short issue title. |
-| `description` | Plain text or Markdown description when available. |
-| `priority` | Numeric priority, or `null` when unavailable. |
-| `state` | Current workflow state name used by `states.active` and reconciliation. |
+| `description` | Plain text or Markdown description, or `null`. |
+| `priority` | Numeric priority, or `null`. |
+| `state` | Current tracker state used by `states.active` and reconciliation. |
 | `branchName` | External suggested branch name, or `null`. |
 | `url` | Browser URL for operators, or `null`. |
-| `labels` | Normalized string labels. |
-| `blockedBy` | Known blockers, mapped to ID/identifier/state when available. |
-| `createdAt`, `updatedAt` | ISO timestamps or `null`. |
+| `labels` | Lowercase or consistently normalized labels. |
+| `blockedBy` | Known blockers mapped to ID/identifier/state when available. |
+| `createdAt`, `updatedAt` | Tracker timestamps or `null`. |
 
-Keep raw tracker payloads out of run state, logs, dashboard responses, and comments unless there is a
-clear, redacted reason.
+Registry-created adapters are wrapped with `validateTrackedIssues()`, so invalid normalized payloads
+fail before entering the orchestrator.
+
+Do not store raw tracker payloads in run state, logs, dashboard responses, or comments.
 
 ---
 
-## Example Adapter
+## Capabilities
 
-The example below includes `fetchCandidateIssues`, `fetchIssue`, `commentOnIssue`, and
-`transitionIssue` helper methods. The methods required by Symphony are `listIssues`,
-`addPullRequestComment`, `addNeedsHumanAttentionComment`, and `transitionToHumanReview`.
+Trackers declare capabilities through the registry:
 
 ```ts
-class ExampleTrackerAdapter implements TrackerAdapter {
-  constructor(private readonly config: ExampleTrackerConfig) {}
-
-  async listIssues(): Promise<Issue[]> {
-    return this.fetchCandidateIssues();
-  }
-
-  async fetchCandidateIssues(): Promise<Issue[]> {
-    const payloads = await this.fetchJson("/issues?state=ready");
-    return payloads.map(normalizeExampleIssue);
-  }
-
-  async fetchIssue(id: string): Promise<Issue> {
-    const payload = await this.fetchJson(`/issues/${encodeURIComponent(id)}`);
-    return normalizeExampleIssue(payload);
-  }
-
-  async addPullRequestComment(issue: Issue, prUrl: string): Promise<void> {
-    await this.commentOnIssue(issue.id, `Draft PR created: ${prUrl}`);
-  }
-
-  async addNeedsHumanAttentionComment(issue: Issue, state: IssueRunState): Promise<void> {
-    await this.commentOnIssue(issue.id, `Symphony needs human attention after ${state.attemptNumber} attempt(s).`);
-  }
-
-  async transitionToHumanReview(issue: Issue): Promise<void> {
-    await this.transitionIssue(issue.id, this.config.reviewState);
-  }
-
-  async commentOnIssue(id: string, body: string): Promise<void> {
-    // POST tracker comment API.
-  }
-
-  async transitionIssue(id: string, targetState: string): Promise<void> {
-    // POST tracker transition/state API.
-  }
-}
+export type TrackerCapabilities = {
+  canComment: boolean;
+  canTransition: boolean;
+  canFetchByQuery: boolean;
+  canFetchByLabel: boolean;
+};
 ```
 
-See `examples/ExampleTrackerAdapter.ts` for a fuller template.
+Workflow authors can require capabilities:
+
+```yaml
+tracker:
+  kind: github-issues
+  require_comment: true
+  require_transition: true
+  require_fetch_by_label: true
+```
+
+If the selected adapter does not support a required capability, the orchestrator fails during
+startup with a clear error.
 
 ---
 
 ## Register The Tracker
 
-Register tracker support in `src/trackers/registry.ts`:
+Register a tracker through `TrackerRegistry` in `src/trackers/registry.ts`:
 
 ```ts
 registerTracker<ExampleTrackerConfig>({
   kind: "example",
-  validate(raw, context) {
+  capabilities: {
+    canComment: true,
+    canTransition: true,
+    canFetchByQuery: true,
+    canFetchByLabel: false
+  },
+  validateConfig(raw, context) {
     const baseUrl = stringAt(raw, "baseUrl", context.issues, "tracker.base_url");
     const apiToken = stringAt(raw, "apiToken", context.issues, "tracker.api_token");
-    const reviewState =
-      optionalStringAt(raw, "reviewState", context.issues, "tracker.review_state") ?? "Human Review";
-
     if (baseUrl === undefined || apiToken === undefined) {
       return undefined;
     }
-
     return {
       kind: "example",
       baseUrl,
-      apiToken,
-      reviewState
+      apiToken
     };
   },
   create(config) {
@@ -155,61 +132,93 @@ instantiate the adapter without changes to `Orchestrator`.
 
 ---
 
-## Add Schema Validation
+## Example Skeleton
 
-Tracker validation lives with the registration. A validator should:
+```ts
+export class ExampleTrackerAdapter implements TrackerAdapter {
+  readonly capabilities = {
+    canComment: true,
+    canTransition: true,
+    canFetchByQuery: true,
+    canFetchByLabel: false
+  };
 
-- Validate only fields for that tracker kind.
-- Return a typed tracker config object.
-- Push human-readable messages into `context.issues`.
-- Resolve file paths relative to `context.baseDir` when the config points to local files.
-- Apply safe defaults for optional fields.
-- Reject invalid limits, empty state names, and malformed URLs where relevant.
+  async listIssues(): Promise<TrackedIssue[]> {
+    return this.fetchCandidateIssues();
+  }
 
-Use secret-like names such as `api_token` / `apiToken` so CLI and log redaction can catch them.
+  async fetchCandidateIssues(): Promise<TrackedIssue[]> {
+    return [];
+  }
 
----
+  async fetchIssue(id: string): Promise<TrackedIssue> {
+    throw new Error("Not implemented");
+  }
 
-## Placeholder Workflow Example
+  async addPullRequestComment(issue: TrackedIssue, prUrl: string): Promise<void> {
+    await this.commentOnIssue(issue.id, `Draft PR created: ${prUrl}`);
+  }
 
-The snippet below shows the intended config shape for a custom tracker. It is documentation-only and
-will not validate until a tracker with that `kind` is registered. Keep invalid placeholder configs
-out of `examples/WORKFLOW*.md`; those files are expected to validate.
+  async addNeedsHumanAttentionComment(issue: TrackedIssue, state: IssueRunState): Promise<void> {
+    await this.commentOnIssue(
+      issue.id,
+      `Symphony needs human attention after ${state.attemptCount} attempt(s). Last error: ${state.lastErrorMessage ?? state.lastErrorType ?? "unknown"}.`
+    );
+  }
 
-```yaml
-tracker:
-  kind: example
-  base_url: https://tracker.example
-  api_token: ${EXAMPLE_TRACKER_API_TOKEN}
-  project_key: DEMO
-  candidate_state: Ready
-  review_state: Human Review
+  async transitionToHumanReview(issue: TrackedIssue): Promise<void> {
+    await this.transitionIssue(issue.id, "Human Review");
+  }
+
+  async commentOnIssue(id: string, body: string): Promise<void> {
+    throw new Error("Not implemented");
+  }
+
+  async transitionIssue(id: string, targetState: string): Promise<void> {
+    throw new Error("Not implemented");
+  }
+}
 ```
 
+See `examples/ExampleTrackerAdapter.ts` for a fuller template.
+
 ---
 
-## Tests
+## Validation
+
+Tracker validation lives with the registry factory. A validator should:
+
+- Validate only fields for that tracker kind.
+- Return a typed config object.
+- Push human-readable messages into `context.issues`.
+- Resolve local file paths relative to `context.baseDir`.
+- Apply safe defaults for optional fields.
+- Reject invalid limits, empty labels, empty states, and malformed URLs where relevant.
+- Use secret-like config names such as `token` or `api_token` so redaction catches them.
+
+---
+
+## Testing Strategy
 
 Add tests that avoid real credentials and external services:
 
-- Unit test the adapter's payload normalization.
-- Mock network calls for fetch, comment, and transition behavior.
-- Test config validation for required and optional fields.
-- Test registry creation for the new `kind`.
-- Add an orchestrator-level test that registers the new tracker and runs without injecting a
-  tracker dependency. This proves orchestrator core still depends only on `TrackerAdapter`.
-
-`tests/trackerRegistry.test.ts` contains the current custom-registration coverage pattern.
+- Adapter payload normalization.
+- Mocked network calls for fetch, comment, and transition behavior.
+- Config validation for required and optional fields.
+- Unknown tracker kind behavior.
+- Capability requirement failures.
+- Registry creation for the new `kind`.
+- An orchestrator-level test proving the core does not import concrete tracker adapters.
 
 ---
 
 ## Safety Considerations
 
 - Do not log raw API tokens, environment variables, or full tracker payloads.
-- Keep writeback idempotent when possible; duplicate daemon polls should not spam comments.
-- Transition only to a configured human-review state; never auto-close or auto-merge work.
+- Keep comments and transitions idempotent where the tracker API allows it.
+- Transition only to configured human-review states or labels.
+- Never close issues automatically unless a future explicit workflow adds that behavior.
+- Never merge PRs from a tracker adapter.
 - Preserve draft PR behavior.
-- Ensure errors that may be transient are classified clearly before adding retry behavior.
 - Do not expose private tracker fields through the dashboard API.
-- Keep workspace paths under the configured workspace root.
-- Document any tracker-specific rate limits and pagination behavior.
+- Document tracker-specific rate limits and pagination behavior.

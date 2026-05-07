@@ -63,6 +63,7 @@ test("validateWorkflow resolves env values and normalizes paths", () => {
 
     assert.equal(config.tracker.kind, "mock");
     assert.equal(config.agent.kind, "dry-run");
+    assert.deepEqual(config.state, { kind: "memory" });
     assert.equal(config.workflowPath, "/repo/examples/WORKFLOW.md");
     assert.equal(config.limits.maxConcurrency, 1);
     assert.equal(config.workspace.root, "/repo/examples/tmp/workspaces");
@@ -93,6 +94,93 @@ test("validateWorkflow resolves env values and normalizes paths", () => {
       process.env.WORKSPACE_ROOT = previous;
     }
   }
+});
+
+test("validateWorkflow accepts Postgres state configuration", () => {
+  const workflow = validWorkflow
+    .replace(
+      "workspace:\n  root: ${WORKSPACE_ROOT}",
+      [
+        "state:",
+        "  kind: postgres",
+        "  connection_string: ${DATABASE_URL}",
+        "  lock_ttl_seconds: 600",
+        "workspace:",
+        "  root: ${WORKSPACE_ROOT}"
+      ].join("\n")
+    )
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
+  const previous = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = "postgres://orchestrator:secret@localhost:5432/orchestrator";
+  try {
+    const parsed = parseWorkflow(workflow);
+    const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
+
+    assert.deepEqual(config.state, {
+      kind: "postgres",
+      connectionString: "postgres://orchestrator:secret@localhost:5432/orchestrator",
+      lockTtlSeconds: 600
+    });
+  } finally {
+    if (previous === undefined) {
+      delete process.env.DATABASE_URL;
+    } else {
+      process.env.DATABASE_URL = previous;
+    }
+  }
+});
+
+test("validateWorkflow rejects invalid Postgres state configuration", () => {
+  const workflow = validWorkflow
+    .replace(
+      "workspace:\n  root: ${WORKSPACE_ROOT}",
+      [
+        "state:",
+        "  kind: postgres",
+        "workspace:",
+        "  root: ${WORKSPACE_ROOT}"
+      ].join("\n")
+    )
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
+  const parsed = parseWorkflow(workflow);
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/examples/WORKFLOW.md"),
+    /state.connection_string must be provided/
+  );
+});
+
+test("validateWorkflow rejects unsupported state stores with an actionable message", () => {
+  const workflow = validWorkflow
+    .replace(
+      "workspace:\n  root: ${WORKSPACE_ROOT}",
+      [
+        "state:",
+        "  kind: sqlite",
+        "  path: ./state.db",
+        "workspace:",
+        "  root: ${WORKSPACE_ROOT}"
+      ].join("\n")
+    )
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
+  const parsed = parseWorkflow(workflow);
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/examples/WORKFLOW.md"),
+    /SQLite is not implemented/
+  );
+});
+
+test("validateWorkflow rejects unsupported parallel orchestration with an actionable message", () => {
+  const workflow = validWorkflow
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
+    .replace("max_concurrency: 1", "max_concurrency: 2");
+  const parsed = parseWorkflow(workflow);
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/examples/WORKFLOW.md"),
+    /parallel orchestration is implemented/
+  );
 });
 
 test("validateWorkflow accepts daemon poll interval configuration", () => {
@@ -325,4 +413,45 @@ test("validateWorkflow accepts codex runner configuration", () => {
     assert.equal(config.agent.timeoutSeconds, 300);
     assert.equal(config.agent.logDir, "/repo/examples/logs");
   }
+});
+
+test("validateWorkflow accepts shell runner configuration", () => {
+  const workflow = validWorkflow
+    .replace(
+      "kind: dry-run\n  timeout_seconds: 300",
+      [
+        "kind: shell",
+        "  command: my-agent --non-interactive",
+        "  timeout_minutes: 2",
+        "  prompt_mode: file",
+        "  env:",
+        "    AGENT_MODE: coding"
+      ].join("\n")
+    )
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
+  const parsed = parseWorkflow(workflow);
+  const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
+
+  assert.equal(config.agent.kind, "shell");
+  if (config.agent.kind === "shell") {
+    assert.equal(config.agent.command, "my-agent --non-interactive");
+    assert.equal(config.agent.timeoutSeconds, 120);
+    assert.equal(config.agent.promptMode, "file");
+    assert.deepEqual(config.agent.env, { AGENT_MODE: "coding" });
+  }
+});
+
+test("validateWorkflow rejects invalid shell prompt mode", () => {
+  const workflow = validWorkflow
+    .replace(
+      "kind: dry-run\n  timeout_seconds: 300",
+      "kind: shell\n  command: my-agent\n  prompt_mode: socket"
+    )
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
+  const parsed = parseWorkflow(workflow);
+
+  assert.throws(
+    () => validateWorkflow(parsed, "/repo/examples/WORKFLOW.md"),
+    /agent.prompt_mode must be stdin or file/
+  );
 });

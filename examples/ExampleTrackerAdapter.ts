@@ -52,7 +52,7 @@ export class ExampleTrackerAdapter implements TrackerAdapter {
   async addNeedsHumanAttentionComment(issue: Issue, state: IssueRunState): Promise<void> {
     await this.commentOnIssue(
       issue.id,
-      `Symphony needs human attention after ${state.attemptNumber} attempt(s). Last error: ${state.lastError ?? "unknown"}.`
+      `Symphony needs human attention after ${state.attemptCount} attempt(s). Last error: ${state.lastErrorMessage ?? state.lastErrorType ?? "unknown"}.`
     );
   }
 
@@ -94,7 +94,13 @@ export class ExampleTrackerAdapter implements TrackerAdapter {
 export function registerExampleTracker(): void {
   registerTracker<ExampleTrackerConfig>({
     kind: "example",
-    validate(raw, context) {
+    capabilities: {
+      canComment: true,
+      canTransition: true,
+      canFetchByQuery: true,
+      canFetchByLabel: false
+    },
+    validateConfig(raw, context) {
       const baseUrl = requiredString(raw, "baseUrl", context, "tracker.base_url");
       const apiToken = requiredString(raw, "apiToken", context, "tracker.api_token");
       const projectKey = requiredString(raw, "projectKey", context, "tracker.project_key");

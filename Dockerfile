@@ -25,6 +25,7 @@ RUN apt-get update \
     git \
     gnupg \
     openssh-client \
+    postgresql-client \
   && mkdir -p /etc/apt/keyrings \
   && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \

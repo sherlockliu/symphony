@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { Orchestrator } from "../src/orchestrator/orchestrator.js";
 import { registerTracker, registeredTrackerKinds, type CustomTrackerConfig } from "../src/trackers/registry.js";
 import type { TrackerAdapter } from "../src/trackers/tracker.js";
@@ -35,7 +36,13 @@ test("a custom tracker can be registered and used without changing orchestrator 
 
   registerTracker<ExampleTrackerConfig>({
     kind: customKind,
-    validate(raw, context) {
+    capabilities: {
+      canComment: false,
+      canTransition: false,
+      canFetchByQuery: true,
+      canFetchByLabel: false
+    },
+    validateConfig(raw, context) {
       const queueName = requiredString(raw.queueName, "tracker.queue_name", context.issues);
       const apiToken = requiredString(raw.apiToken, "tracker.api_token", context.issues);
       if (queueName === undefined || apiToken === undefined) {
@@ -107,6 +114,41 @@ test("a custom tracker can be registered and used without changing orchestrator 
   assert.equal(listCalls, 1);
   assert.equal(result.processedIssues, 1);
   assert.equal(result.results[0]?.issue, "EXT-1");
+});
+
+test("unknown tracker kind produces a clear validation error", () => {
+  const definition = parseWorkflow(workflowWithTracker([
+    "kind: does-not-exist",
+    "  api_token: secret-value"
+  ]));
+
+  assert.throws(
+    () => validateWorkflow(definition, "/repo/examples/WORKFLOW.md"),
+    /tracker.kind must be one of:/
+  );
+});
+
+test("tracker capability requirements fail clearly when unsupported", () => {
+  const definition = parseWorkflow(workflowWithTracker([
+    "kind: mock",
+    "  issue_file: ./mock-issues.json",
+    "  require_comment: true"
+  ]));
+  const config = validateWorkflow(definition, "/repo/examples/WORKFLOW.md");
+
+  assert.throws(
+    () => new Orchestrator(definition, config, { tracker: { async listIssues() { return []; } } }),
+    /requires unsupported tracker capability: comment/
+  );
+});
+
+test("orchestrator core does not import concrete tracker adapters", async () => {
+  const source = await readFile("src/orchestrator/orchestrator.ts", "utf8");
+
+  assert.equal(source.includes("mockTracker"), false);
+  assert.equal(source.includes("jiraTracker"), false);
+  assert.equal(source.includes("planeTracker"), false);
+  assert.equal(source.includes("githubIssuesTracker"), false);
 });
 
 function requiredString(value: unknown, display: string, issues: string[]): string | undefined {

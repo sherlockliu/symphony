@@ -16,7 +16,9 @@ export function assertInsideRoot(rootPath: string, candidatePath: string): strin
     return candidate;
   }
 
-  throw new PathSafetyError(`Path ${candidate} is outside workspace root ${root}.`);
+  throw new PathSafetyError(
+    `Unsafe workspace path: ${candidate} is outside workspace root ${root}. Check workspace.root, repository.clone_dir, and issue identifiers.`
+  );
 }
 
 export function safePathJoin(rootPath: string, ...segments: string[]): string {

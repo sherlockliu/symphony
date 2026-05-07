@@ -1,14 +1,18 @@
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { createAgentRunner } from "../agents/createAgentRunner.js";
 import { GitService } from "../git/gitService.js";
 import { GitHubPullRequestService, type PullRequestService } from "../github/pullRequestService.js";
 import { renderPrompt } from "../templates/promptRenderer.js";
-import { filterActiveIssues } from "../trackers/mockTracker.js";
+import { assertTrackerCapabilities, filterActiveIssues } from "../trackers/tracker.js";
 import { createTracker } from "../trackers/createTracker.js";
 import type { TrackerAdapter } from "../trackers/tracker.js";
 import type { AgentRunner } from "../agents/agentRunner.js";
 import {
+  createInitialRunState,
   InMemoryRunStateStore,
   isActiveRunState,
+  isRetryableRunState,
   type IssueRunState,
   type RunStateStore
 } from "../state/runStateStore.js";
@@ -53,6 +57,7 @@ export class Orchestrator {
   private readonly pullRequests: PullRequestService;
   private readonly stateStore: RunStateStore;
   private readonly now: () => Date;
+  private readonly lockOwner: string;
 
   constructor(
     private readonly definition: WorkflowDefinition,
@@ -66,6 +71,8 @@ export class Orchestrator {
     this.pullRequests = dependencies.pullRequests ?? new GitHubPullRequestService(config);
     this.stateStore = dependencies.stateStore ?? new InMemoryRunStateStore();
     this.now = dependencies.now ?? (() => new Date());
+    this.lockOwner = `orchestrator-${process.pid}@${hostname()}`;
+    assertTrackerCapabilities(this.tracker, config.tracker.requiredCapabilities, `tracker ${config.tracker.kind}`);
   }
 
   async runOnce(options: OrchestratorRunOptions = {}): Promise<OrchestratorCycleResult> {
@@ -91,6 +98,10 @@ export class Orchestrator {
         results.push(summary);
         options.onIssueCompleted?.(summary);
       } catch (error) {
+        if (error instanceof RunLockUnavailableError) {
+          options.onWarning?.(error.message);
+          continue;
+        }
         options.onIssueFailed?.(issue, error);
         throw error;
       }
@@ -106,6 +117,12 @@ export class Orchestrator {
   }
 
   private async runIssue(issue: Issue, options: OrchestratorRunOptions): Promise<IssueRunSummary> {
+    const preflightState = (await this.stateStore.getByIssueId(issue.id))
+      ?? createInitialRunState(issue, this.config, this.nowIso());
+    const lockedState = await this.acquireRunLock(preflightState, options);
+    if (lockedState === null) {
+      throw new RunLockUnavailableError(`${issue.identifier} already has an active run lock.`);
+    }
     let state = await this.beginAttempt(issue, options);
     try {
       const workspace = await this.workspaceManager.createIssueWorkspace(issue);
@@ -131,7 +148,7 @@ export class Orchestrator {
       const pullRequestResult = agentResult.success
         ? await this.createPullRequestWithState(issue, workspace, gitPlan.branchName, state, options)
         : skippedPullRequest("agent_failed");
-      state = (await this.stateStore.get(issue.id)) ?? state;
+      state = (await this.stateStore.getByIssueId(issue.id)) ?? state;
       const trackerResult = await this.updateTrackerAfterPullRequestWithState(issue, pullRequestResult.url, state, options);
 
       const summary: IssueRunSummary = {
@@ -156,23 +173,34 @@ export class Orchestrator {
           completedAt: this.nowIso(),
           pullRequestUrl: pullRequestResult.url,
           logsPath: agentResult.logPath,
-          lastError: null
+          lastErrorType: null,
+          lastErrorMessage: null,
+          nextRetryAt: null
         }, options);
         return summary;
       }
 
-      await this.recordFailure(state, issue, agentResult.timedOut ? "agent_timeout" : "agent_failed", options);
+      await this.recordFailure(
+        state,
+        issue,
+        agentResult.timedOut ? "agent_timeout" : "agent_failed",
+        agentResult.timedOut ? "Agent runner timed out." : "Agent runner returned a failure result.",
+        options
+      );
       return summary;
     } catch (error) {
-      const latest = (await this.stateStore.get(issue.id)) ?? state;
-      await this.recordFailure(latest, issue, classifyError(error), options);
+      const latest = (await this.stateStore.getByIssueId(issue.id)) ?? state;
+      const classified = classifyError(error);
+      await this.recordFailure(latest, issue, classified.type, classified.message, options);
       throw error;
+    } finally {
+      await this.releaseRunLock(state, options);
     }
   }
 
   private async reconcileTrackerState(issues: Issue[], options: OrchestratorRunOptions): Promise<void> {
     for (const issue of issues) {
-      let existing = await this.stateStore.get(issue.id);
+      let existing = await this.stateStore.getByIssueId(issue.id);
       if (existing === undefined) {
         continue;
       }
@@ -190,7 +218,7 @@ export class Orchestrator {
       }
       if (existing.state !== "succeeded" && existing.state !== "needs_human_attention") {
         await this.updateState(existing, {
-          state: this.isCancelledTrackerState(issue.state) ? "cancelled" : "skipped",
+          state: this.isCancelledTrackerState(issue.state) ? "cancelled" : "cancelled",
           completedAt: existing.completedAt ?? this.nowIso()
         }, options);
       }
@@ -198,9 +226,9 @@ export class Orchestrator {
   }
 
   private async isEligibleForRun(issue: Issue, options: OrchestratorRunOptions): Promise<boolean> {
-    const existing = await this.stateStore.get(issue.id);
+    const existing = await this.stateStore.getByIssueId(issue.id);
     if (existing === undefined) {
-      await this.saveState(initialState(issue, this.nowIso()), options);
+      await this.saveState(createInitialRunState(issue, this.config, this.nowIso()), options);
       return true;
     }
     if (isActiveRunState(existing.state)) {
@@ -209,22 +237,18 @@ export class Orchestrator {
     if (existing.state === "succeeded" && !this.config.retry.rerunSucceeded) {
       return false;
     }
-    if (existing.state === "needs_human_attention" || existing.state === "cancelled") {
+    if (existing.state === "needs_human_attention" || existing.state === "cancelled" || existing.state === "failed_terminal") {
       return false;
     }
     if (existing.pullRequestUrl !== null && !this.config.retry.retryWithExistingPullRequest) {
       return false;
     }
-    if (existing.state === "failed") {
-      if (!this.isRetryableError(existing.lastError)) {
+    if (existing.state === "failed_retryable") {
+      if (existing.attemptCount >= existing.maxAttempts) {
         await this.markNeedsHumanAttention(issue, existing, options);
         return false;
       }
-      if (existing.attemptNumber >= this.config.retry.maxAttempts) {
-        await this.markNeedsHumanAttention(issue, existing, options);
-        return false;
-      }
-      if (!this.cooldownElapsed(existing)) {
+      if (!isRetryableRunState(existing, this.now())) {
         return false;
       }
     }
@@ -232,27 +256,74 @@ export class Orchestrator {
   }
 
   private async beginAttempt(issue: Issue, options: OrchestratorRunOptions): Promise<IssueRunState> {
-    const existing = await this.stateStore.get(issue.id);
+    const existing = await this.stateStore.getByIssueId(issue.id);
     const now = this.nowIso();
-    const attemptNumber = existing === undefined ? 1 : existing.attemptNumber + 1;
+    const attemptCount = existing === undefined ? 1 : existing.attemptCount + 1;
     const state: IssueRunState = {
-      issueId: issue.id,
+      id: existing?.id ?? randomUUID(),
+      trackerKind: this.config.tracker.kind,
+      trackerIssueId: issue.id,
       issueIdentifier: issue.identifier,
-      attemptNumber,
+      issueUrl: issue.url,
+      issueTitle: issue.title,
+      attemptCount,
+      maxAttempts: this.config.retry.maxAttempts,
       state: "queued",
+      createdAt: existing?.createdAt ?? now,
       startedAt: now,
       updatedAt: now,
       completedAt: null,
-      lastError: null,
+      lastErrorType: null,
+      lastErrorMessage: null,
       workspacePath: existing?.workspacePath ?? null,
       branchName: existing?.branchName ?? issue.branchName,
       pullRequestUrl: existing?.pullRequestUrl ?? null,
       trackerStateAtStart: issue.state,
       trackerStateLatest: issue.state,
-      logsPath: existing?.logsPath ?? null
+      logsPath: existing?.logsPath ?? null,
+      nextRetryAt: null,
+      lockOwner: existing?.lockOwner ?? null,
+      lockExpiresAt: existing?.lockExpiresAt ?? null,
+      metadata: existing?.metadata ?? {}
     };
     await this.saveState(state, options);
     return state;
+  }
+
+  private async acquireRunLock(
+    state: IssueRunState,
+    options: OrchestratorRunOptions
+  ): Promise<IssueRunState | null> {
+    if (this.stateStore.acquireLock === undefined) {
+      return state;
+    }
+    const expiresAt = new Date(this.now().getTime() + this.lockTtlSeconds() * 1000);
+    const acquired = await this.stateStore.acquireLock(state, this.lockOwner, expiresAt);
+    if (!acquired) {
+      return null;
+    }
+    const latest = await this.stateStore.getByIssueId(state.trackerIssueId);
+    const next = latest ?? {
+      ...state,
+      lockOwner: this.lockOwner,
+      lockExpiresAt: expiresAt.toISOString()
+    };
+    options.onRunStateUpdated?.(next);
+    return next;
+  }
+
+  private async releaseRunLock(
+    state: IssueRunState,
+    options: OrchestratorRunOptions
+  ): Promise<void> {
+    if (this.stateStore.releaseLock === undefined) {
+      return;
+    }
+    await this.stateStore.releaseLock(state, this.lockOwner);
+    const latest = await this.stateStore.getByIssueId(state.trackerIssueId);
+    if (latest !== undefined) {
+      options.onRunStateUpdated?.(latest);
+    }
   }
 
   private async createPullRequestWithState(
@@ -308,14 +379,17 @@ export class Orchestrator {
     state: IssueRunState,
     issue: Issue,
     errorCode: string,
+    errorMessage: string,
     options: OrchestratorRunOptions
   ): Promise<void> {
     const failed = await this.updateState(state, {
-      state: "failed",
+      state: this.isRetryableError(errorCode) ? "failed_retryable" : "failed_terminal",
       completedAt: this.nowIso(),
-      lastError: errorCode
+      lastErrorType: errorCode,
+      lastErrorMessage: errorMessage,
+      nextRetryAt: this.isRetryableError(errorCode) ? this.nextRetryIso() : null
     }, options);
-    if (!this.isRetryableError(errorCode) || failed.attemptNumber >= this.config.retry.maxAttempts) {
+    if (this.isRetryableError(errorCode) && failed.attemptCount >= this.config.retry.maxAttempts) {
       await this.markNeedsHumanAttention(issue, failed, options);
     }
   }
@@ -328,7 +402,8 @@ export class Orchestrator {
     if (state.state !== "needs_human_attention") {
       const next = await this.updateState(state, {
         state: "needs_human_attention",
-        completedAt: state.completedAt ?? this.nowIso()
+        completedAt: state.completedAt ?? this.nowIso(),
+        nextRetryAt: null
       }, options);
       if (this.tracker.addNeedsHumanAttentionComment !== undefined) {
         await this.tracker.addNeedsHumanAttentionComment(issue, next);
@@ -338,7 +413,7 @@ export class Orchestrator {
 
   private async updateState(
     state: IssueRunState,
-    patch: Partial<Omit<IssueRunState, "issueId" | "issueIdentifier" | "attemptNumber">>,
+    patch: Partial<Omit<IssueRunState, "id" | "trackerKind" | "trackerIssueId" | "issueIdentifier" | "attemptCount">>,
     options: OrchestratorRunOptions
   ): Promise<IssueRunState> {
     const next: IssueRunState = {
@@ -359,12 +434,6 @@ export class Orchestrator {
     return this.config.states.active.includes(issue.state);
   }
 
-  private cooldownElapsed(state: IssueRunState): boolean {
-    const reference = state.completedAt ?? state.updatedAt;
-    const elapsedMs = this.now().getTime() - Date.parse(reference);
-    return elapsedMs >= this.config.retry.failureCooldownSeconds * 1000;
-  }
-
   private isRetryableError(errorCode: string | null): boolean {
     return errorCode !== null && this.config.retry.retryableErrors.includes(errorCode);
   }
@@ -375,6 +444,21 @@ export class Orchestrator {
 
   private nowIso(): string {
     return this.now().toISOString();
+  }
+
+  private nextRetryIso(): string {
+    return new Date(this.now().getTime() + this.config.retry.failureCooldownSeconds * 1000).toISOString();
+  }
+
+  private lockTtlSeconds(): number {
+    return this.config.state.kind === "postgres" ? this.config.state.lockTtlSeconds : 900;
+  }
+}
+
+class RunLockUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunLockUnavailableError";
   }
 }
 
@@ -416,35 +500,16 @@ function skippedPullRequest(skippedReason: string): PullRequestResult {
   };
 }
 
-function initialState(issue: Issue, now: string): IssueRunState {
-  return {
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    attemptNumber: 0,
-    state: "discovered",
-    startedAt: null,
-    updatedAt: now,
-    completedAt: null,
-    lastError: null,
-    workspacePath: null,
-    branchName: issue.branchName,
-    pullRequestUrl: null,
-    trackerStateAtStart: null,
-    trackerStateLatest: issue.state,
-    logsPath: null
-  };
-}
-
-function classifyError(error: unknown): string {
+function classifyError(error: unknown): { type: string; message: string } {
   const message = error instanceof Error ? error.message : String(error);
   if (/timed?\s*out|timeout|SIGTERM/i.test(message)) {
-    return "agent_timeout";
+    return { type: "agent_timeout", message };
   }
   if (/\b(ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|network)\b/i.test(message)) {
-    return "network_error";
+    return { type: "network_error", message };
   }
   if (/\bHTTP 5\d\d\b|transient|rate limit/i.test(message)) {
-    return "transient_tracker_error";
+    return { type: "transient_tracker_error", message };
   }
-  return "unknown_error";
+  return { type: "unknown_error", message };
 }

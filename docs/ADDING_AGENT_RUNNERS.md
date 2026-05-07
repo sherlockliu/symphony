@@ -1,26 +1,8 @@
 # Adding Agent Runners
 
-Owned Symphony keeps agent-specific execution behind `AgentRunner` and the agent runner registry in
-`src/agents/registry.ts`. The orchestrator core should only depend on `AgentRunner`, not on Codex,
-Claude Code, Aider, Cursor, or internal execution tools directly.
-
----
-
-## When To Add A Runner
-
-Add a runner when a new coding tool needs to receive the rendered Symphony prompt and operate inside
-the prepared issue workspace.
-
-Good candidates:
-
-- The tool can run non-interactively from a command or SDK.
-- It accepts a prompt through stdin, a file, an API call, or another deterministic input channel.
-- It can be constrained to the prepared repository path.
-- It returns a clear success/failure signal.
-- It can produce logs that are useful for audit and debugging.
-
-Do not add a runner if a different `agent.command` / `agent.args` for the existing Codex runner is
-enough.
+Owned Symphony keeps agent-specific execution behind `AgentRunner` and `AgentRunnerRegistry`. The
+orchestrator core should only depend on the runner contract, not on Codex, Shell, Claude Code,
+Aider, Cursor, or internal tools directly.
 
 ---
 
@@ -29,7 +11,8 @@ enough.
 ```ts
 export interface AgentRunner {
   readonly kind: string;
-  run(request: AgentRunRequest): Promise<AgentRunResult>;
+  readonly capabilities?: AgentCapabilities;
+  run(input: AgentRunRequest): Promise<AgentRunResult>;
 }
 ```
 
@@ -39,114 +22,74 @@ export interface AgentRunner {
 | --- | --- |
 | `issue` | Normalized tracker issue selected by the orchestrator. |
 | `workspace.path` | Safe per-issue workspace directory. |
-| `workspace.repoPath` | Repository checkout path where the agent should operate. |
-| `prompt` | Fully rendered prompt from the `WORKFLOW.md` Markdown body. |
-| `workflowPath` | Absolute path to the workflow file that produced the run. |
-| `timeoutSeconds` | Timeout budget configured for this runner. |
+| `workspace.repoPath` | Repository checkout path where the runner should work. |
+| `prompt` | Fully rendered prompt from `WORKFLOW.md`. |
+| `workflowPath` | Absolute workflow path. |
+| `timeoutSeconds` | Runner timeout budget. |
 | `logDir` | Directory where runner logs should be written. |
 
-`AgentRunResult` must report:
-
-| Field | Meaning |
-| --- | --- |
-| `success` | `true` only when the runner completed successfully. |
-| `runner` | Runner kind or concrete runner name. |
-| `exitCode` | Process exit code, or `null` if unavailable. |
-| `timedOut` | `true` when timeout handling terminated the run. |
-| `logPath` | Path to the primary redacted log file. |
-| `stdout`, `stderr` | Captured output, if the runner has process-like streams. |
-
-Failure should be represented in the result when possible. Throw only for infrastructure failures
-that prevent the runner from producing a meaningful result.
-
----
-
-## How Prompts Are Passed
-
-The orchestrator renders the prompt before calling the runner:
+`AgentRunResult` supports the current process-compatible fields plus structured metadata:
 
 ```ts
-const agentResult = await runner.run({
-  issue,
-  workspace,
-  prompt,
-  workflowPath,
-  timeoutSeconds,
-  logDir
-});
+export type AgentRunResult = {
+  success: boolean;
+  runner: string;
+  summary?: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  logPath: string;
+  logsPath?: string;
+  stdout: string;
+  stderr: string;
+  branchName?: string;
+  pullRequestUrl?: string;
+  error?: {
+    type: string;
+    message: string;
+    retryable: boolean;
+  };
+};
 ```
 
-The runner decides how to pass that prompt to the tool:
-
-- stdin for process runners.
-- a temporary file for tools that prefer file input.
-- an SDK/API request body for internal runners.
-
-Prompt logs must be redacted before writing to disk.
+Return failure results when the runner can report cleanly. Throw only for infrastructure failures
+that prevent a meaningful result.
 
 ---
 
-## Logs
+## Capabilities
 
-Each runner should write a primary log under `request.logDir`, usually using the issue identifier in
-the file name.
+```ts
+export type AgentCapabilities = {
+  canEditFiles: boolean;
+  canRunCommands: boolean;
+  canCreateCommits: boolean;
+  canOpenPullRequests: boolean;
+};
+```
 
-Logs should include:
-
-- runner kind
-- issue identifier
-- workspace and repo path
-- command or API operation summary
-- timeout
-- exit code or status
-- stdout/stderr or equivalent diagnostic output
-
-Logs should not include:
-
-- raw API tokens
-- environment variables containing secrets
-- unredacted bearer tokens
-- raw private tracker payloads
-
-Use `redactSecrets()` from `src/logging/redact.ts` before writing logs.
-
----
-
-## Codex Runner
-
-Codex is the first concrete process runner.
-
-Current behavior:
-
-- Uses configured `agent.command` and `agent.args`.
-- Runs in `request.workspace.repoPath`.
-- Sends the rendered prompt on stdin.
-- Captures stdout and stderr.
-- Writes a redacted process log through `NodeProcessExecutor`.
-- Enforces `agent.timeout_seconds`.
-- Reports `success: false`, `exitCode: null`, and `timedOut: true` when the process times out.
-
-The Codex runner does not merge PRs and does not write tracker comments directly. Those actions stay
-in the orchestrator and PR/tracker services.
+Capabilities document runner expectations. Today the orchestrator still owns commit, PR, and tracker
+writeback behavior.
 
 ---
 
 ## Register A Runner
 
-Register runner support in `src/agents/registry.ts`:
-
 ```ts
 registerAgentRunner<ExampleAgentConfig>({
   kind: "example-agent",
-  validate(raw, context) {
+  capabilities: {
+    canEditFiles: true,
+    canRunCommands: true,
+    canCreateCommits: false,
+    canOpenPullRequests: false
+  },
+  validateConfig(raw, context) {
     const command = stringAt(raw, "command", context.issues, "agent.command");
     const timeoutSeconds = optionalNumberAt(raw, "timeoutSeconds", context.issues, "agent.timeout_seconds") ?? 900;
     const logDir = optionalStringAt(raw, "logDir", context.issues, "agent.log_dir") ?? "logs";
-
     if (command === undefined) {
       return undefined;
     }
-
     return {
       kind: "example-agent",
       command,
@@ -154,68 +97,116 @@ registerAgentRunner<ExampleAgentConfig>({
       logDir: path.resolve(context.baseDir, logDir)
     };
   },
-  create(config) {
-    return new ExampleAgentRunner(config);
+  create(config, dependencies) {
+    return new ExampleAgentRunner(config, dependencies?.executor);
   }
 });
 ```
 
-After registration, `validateWorkflow()` accepts `agent.kind: example-agent`, and
-`createAgentRunner()` can instantiate it without changes to `Orchestrator`.
+After registration, `validateWorkflow()` accepts the new `agent.kind`, and `createAgentRunner()` can
+instantiate it without orchestrator changes.
 
 ---
 
-## Add Schema Validation
+## Example Skeleton
 
-Agent validation lives with the registration. A validator should:
+```ts
+export class ExampleAgentRunner implements AgentRunner {
+  readonly kind = "example-agent";
 
-- Validate only fields for that agent kind.
-- Return a typed agent config object.
-- Push readable messages into `context.issues`.
-- Resolve log paths relative to `context.baseDir`.
-- Apply safe defaults for optional fields.
-- Reject invalid timeout values.
-- Keep secret values out of config summaries and logs.
+  async run(input: AgentRunRequest): Promise<AgentRunResult> {
+    return {
+      success: false,
+      runner: this.kind,
+      summary: "Example runner is not implemented",
+      exitCode: null,
+      timedOut: false,
+      logPath: path.join(input.logDir, `${input.issue.identifier}-example.log`),
+      stdout: "",
+      stderr: "Example runner is a template only",
+      error: {
+        type: "agent_not_implemented",
+        message: "Example runner is a template only",
+        retryable: false
+      }
+    };
+  }
+}
+```
 
-Use `timeout_seconds` and `log_dir` in `WORKFLOW.md`; the parser normalizes them to
-`timeoutSeconds` and `logDir`.
-
----
-
-## Example Template
-
-See `examples/ExampleAgentRunner.ts` for a template runner. It demonstrates:
-
-- typed config
-- registry validation
-- prompt handling
-- redacted log writing
-- timeout-aware result shape
-
----
-
-## Tests
-
-Add tests that do not require real external tools:
-
-- Unit test config validation for required and optional fields.
-- Unit test the runner with mocked process execution or fake SDK calls.
-- Assert logs are redacted.
-- Assert timeout behavior.
-- Add an orchestrator-level test that registers the new runner and runs without injecting a runner
-  dependency. This proves orchestrator core still depends only on `AgentRunner`.
-
-`tests/agentRegistry.test.ts` contains the current custom-registration coverage pattern.
+See `examples/ExampleAgentRunner.ts` for a fuller template.
 
 ---
 
-## Safety Considerations
+## Prompt Handling
 
-- Run only inside `request.workspace.repoPath`.
-- Enforce the configured timeout.
-- Capture logs for auditability.
+Runner-specific options decide how prompts are passed:
+
+- `stdin`: send the rendered prompt to the process stdin.
+- `file`: write `.orchestrator/prompt.md` inside the repo workspace and pass that path to the tool.
+- SDK/API runners may place the prompt in an API request body.
+
+`agent.save_prompt` defaults to `false` for command runners. DryRun intentionally writes the prompt
+because its purpose is previewing the rendered task.
+
+Always redact prompt logs with `redactSecrets()`.
+
+---
+
+## Logs And Timeouts
+
+All production runners should:
+
+- Create a per-run log path or log directory under `request.logDir`.
+- Capture stdout and stderr when process-like streams exist.
+- Enforce `timeoutSeconds`.
 - Redact secrets before writing logs.
-- Avoid returning raw secrets in stdout/stderr if a service call may echo credentials.
-- Do not let runners create, merge, or close PRs directly.
-- Do not let runners transition tracker issues directly.
+- Return `logsPath` when multiple log files are created.
+
+Use `NodeProcessExecutor` for process runners when possible; it centralizes timeout handling and
+redacted process logs.
+
+---
+
+## Shell Runner
+
+`agent.kind: shell` is the generic production extension point for Claude Code, Aider, Cursor CLI,
+internal agents, or custom scripts.
+
+```yaml
+agent:
+  kind: shell
+  command: "my-agent --non-interactive"
+  timeout_minutes: 60
+  prompt_mode: stdin
+  save_prompt: false
+  env:
+    AGENT_MODE: coding
+```
+
+The shell runner runs inside `request.workspace.repoPath`. Treat it as trusted code execution:
+configure least-privilege credentials and isolated workspaces.
+
+---
+
+## Testing Strategy
+
+Add tests without real external tools:
+
+- Registry registration and unknown kind validation.
+- Per-runner config validation.
+- Prompt passing mode.
+- Timeout behavior.
+- Log capture and secret redaction.
+- Orchestrator import guard proving concrete runners stay outside core.
+
+---
+
+## Security Considerations
+
+- Run only trusted commands.
+- Run inside the prepared repo workspace.
+- Use least-privilege credentials.
+- Prefer isolated containers or locked-down machines for real agents.
+- Do not let runners merge PRs or transition tracker issues directly.
 - Keep destructive cleanup out of runner defaults.

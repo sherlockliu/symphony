@@ -8,6 +8,7 @@ import { createAgentRunner } from "../src/agents/createAgentRunner.js";
 import { DryRunRunner } from "../src/agents/dryRunRunner.js";
 import type { ProcessExecutor, ProcessRequest, ProcessResult } from "../src/agents/processExecutor.js";
 import type { CodexAgentConfig, DryRunAgentConfig } from "../src/agents/registry.js";
+import { ShellRunner } from "../src/agents/shellRunner.js";
 import type { AgentRunRequest, Issue, IssueWorkspace, WorkflowConfig } from "../src/types.js";
 
 const issue: Issue = {
@@ -30,6 +31,7 @@ function workflowConfig(root: string): WorkflowConfig {
     version: 1,
     workflowPath: path.join(root, "WORKFLOW.md"),
     tracker: { kind: "mock", issueFile: path.join(root, "issues.json") },
+    state: { kind: "memory" },
     workspace: { root: path.join(root, "workspaces") },
     repository: {
       url: root,
@@ -192,6 +194,117 @@ test("CodexRunner captures stdout and stderr while process logs redact secrets",
   }
 });
 
+test("ShellRunner passes prompt through stdin and captures redacted logs", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-shell-stdin-"));
+  const calls: ProcessRequest[] = [];
+  const executor: ProcessExecutor = {
+    async execute(processRequest: ProcessRequest): Promise<ProcessResult> {
+      calls.push(processRequest);
+      return {
+        exitCode: 0,
+        timedOut: false,
+        stdout: "OPENAI_API_KEY=sk-testsecretvalue\nok",
+        stderr: ""
+      };
+    }
+  };
+
+  try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
+    const result = await new ShellRunner({
+      kind: "shell",
+      command: "my-agent --non-interactive",
+      timeoutSeconds: 60,
+      logDir: path.join(root, "logs"),
+      promptMode: "stdin",
+      env: { AGENT_MODE: "coding" },
+      savePrompt: false
+    }, executor).run(request(root));
+    const stdoutLog = await readFile(path.join(result.logsPath!, "stdout.log"), "utf8");
+
+    assert.equal(result.success, true);
+    assert.equal(calls[0]!.cwd, path.join(root, "workspaces", "ABC-7", "repo"));
+    assert.equal(calls[0]!.input, request(root).prompt);
+    assert.deepEqual(calls[0]!.env, { AGENT_MODE: "coding" });
+    assert.equal(stdoutLog.includes("sk-testsecretvalue"), false);
+    assert.match(stdoutLog, /OPENAI_API_KEY=\[REDACTED\]/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ShellRunner writes a safe prompt file for file prompt mode", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-shell-file-"));
+  const calls: ProcessRequest[] = [];
+  const executor: ProcessExecutor = {
+    async execute(processRequest: ProcessRequest): Promise<ProcessResult> {
+      calls.push(processRequest);
+      return {
+        exitCode: 0,
+        timedOut: false,
+        stdout: "ok",
+        stderr: ""
+      };
+    }
+  };
+
+  try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
+    const result = await new ShellRunner({
+      kind: "shell",
+      command: "my-agent --prompt-file",
+      timeoutSeconds: 60,
+      logDir: path.join(root, "logs"),
+      promptMode: "file",
+      env: {},
+      savePrompt: false
+    }, executor).run(request(root));
+    const promptPath = path.join(root, "workspaces", "ABC-7", "repo", ".orchestrator", "prompt.md");
+    const prompt = await readFile(promptPath, "utf8");
+
+    assert.equal(result.success, true);
+    assert.equal(calls[0]!.input, "");
+    assert.match(calls[0]!.args.join(" "), /\.orchestrator\/prompt\.md/);
+    assert.match(prompt, /OPENAI_API_KEY=\[REDACTED\]/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ShellRunner reports timeout failures", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-shell-timeout-"));
+  const executor: ProcessExecutor = {
+    async execute(): Promise<ProcessResult> {
+      return {
+        exitCode: null,
+        timedOut: true,
+        stdout: "",
+        stderr: "timeout"
+      };
+    }
+  };
+
+  try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
+    const result = await new ShellRunner({
+      kind: "shell",
+      command: "slow-agent",
+      timeoutSeconds: 1,
+      logDir: path.join(root, "logs"),
+      promptMode: "stdin",
+      env: {},
+      savePrompt: false
+    }, executor).run(request(root));
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.error?.type, "agent_timeout");
+    assert.equal(result.error?.retryable, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("createAgentRunner keeps runner construction behind the generic interface", () => {
   const root = "/tmp/symphony";
   assert.equal(createAgentRunner(workflowConfig(root)).kind, "dry-run");
@@ -205,4 +318,16 @@ test("createAgentRunner keeps runner construction behind the generic interface",
       logDir: path.join(root, "logs")
     }
   }).kind, "codex");
+  assert.equal(createAgentRunner({
+    ...workflowConfig(root),
+    agent: {
+      kind: "shell",
+      command: "my-agent",
+      timeoutSeconds: 60,
+      logDir: path.join(root, "logs"),
+      promptMode: "stdin",
+      env: {},
+      savePrompt: false
+    }
+  }).kind, "shell");
 });
