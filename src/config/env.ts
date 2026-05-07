@@ -28,7 +28,9 @@ function interpolateString(value: string, env: NodeJS.ProcessEnv): string {
   return value.replace(/\$\{([A-Z0-9_]+)\}/gi, (_, name: string) => {
     const resolved = env[name];
     if (resolved === undefined) {
-      throw new EnvironmentInterpolationError(`Missing environment variable ${name}.`);
+      throw new EnvironmentInterpolationError(
+        `Missing environment variable ${name}. Set it before running the CLI, or replace \${${name}} in WORKFLOW.md with a non-secret example value for local validation.`
+      );
     }
     return resolved;
   });

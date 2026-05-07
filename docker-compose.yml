@@ -6,6 +6,7 @@ x-orchestrator-base: &orchestrator-base
   init: true
   working_dir: /app
   environment:
+    DATABASE_URL: ${DATABASE_URL:-postgres://orchestrator:orchestrator@postgres:5432/orchestrator}
     JIRA_EMAIL: ${JIRA_EMAIL:-}
     JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
     PLANE_API_KEY: ${PLANE_API_KEY:-}
@@ -16,9 +17,21 @@ x-orchestrator-base: &orchestrator-base
     - ./config:/config:ro
     - ./workspaces:/workspaces
     - ./logs:/logs
-  network_mode: bridge
+  depends_on:
+    - postgres
 
 services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: orchestrator
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orchestrator}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+
   orchestrator:
     <<: *orchestrator-base
     command: ["validate", "/config/WORKFLOW.md"]
@@ -42,3 +55,6 @@ services:
     <<: *orchestrator-base
     profiles: ["daemon"]
     command: ["daemon", "/config/WORKFLOW.md"]
+
+volumes:
+  postgres-data:

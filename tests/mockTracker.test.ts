@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MockTracker, filterActiveIssues } from "../src/trackers/mockTracker.js";
+import { MockTracker } from "../src/trackers/mockTracker.js";
+import { filterActiveIssues } from "../src/trackers/tracker.js";
 
 test("MockTracker normalizes issue fields and filters active issues", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "symphony-mock-"));

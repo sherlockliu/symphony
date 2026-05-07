@@ -83,7 +83,13 @@ export class ExampleAgentRunner implements AgentRunner {
 export function registerExampleAgentRunner(): void {
   registerAgentRunner<ExampleAgentConfig>({
     kind: "example-agent",
-    validate(raw, context) {
+    capabilities: {
+      canEditFiles: true,
+      canRunCommands: true,
+      canCreateCommits: false,
+      canOpenPullRequests: false
+    },
+    validateConfig(raw, context) {
       const command = requiredString(raw, "command", context, "agent.command");
       const timeoutSeconds = optionalNumber(raw, "timeoutSeconds", context, "agent.timeout_seconds") ?? 900;
       const logDir = optionalString(raw, "logDir", context, "agent.log_dir") ?? "logs";

@@ -18,6 +18,7 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
   const baseDir = path.dirname(path.resolve(workflowPath));
 
   const tracker = objectAt(config, "tracker", issues);
+  const state = objectAt(config, "state", issues, "state", false);
   const workspace = objectAt(config, "workspace", issues);
   const repository = objectAt(config, "repository", issues);
   const branch = objectAt(config, "branch", issues, "branch", false);
@@ -31,6 +32,9 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
 
   const version = numberAt(config, "version", issues);
   const trackerConfig = validateTrackerConfig(tracker, { baseDir, issues });
+  const stateKind = optionalStringAt(state, "kind", issues, "state.kind") ?? "memory";
+  const postgresConnectionString = optionalStringAt(state, "connectionString", issues, "state.connection_string");
+  const postgresLockTtlSeconds = optionalNumberAt(state, "lockTtlSeconds", issues, "state.lock_ttl_seconds") ?? 900;
   const agentConfig = validateAgentConfig(agent, { baseDir, issues });
   const workspaceRoot = stringAt(workspace, "root", issues, "workspace.root");
   const repositoryUrl = stringAt(repository, "url", issues, "repository.url");
@@ -71,6 +75,19 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
   if (githubDraft !== undefined && githubDraft !== true) {
     issues.push("github.draft must be true; Symphony never creates ready-for-review PRs automatically.");
   }
+  if (stateKind !== "memory" && stateKind !== "postgres") {
+    issues.push("state.kind must be memory or postgres when provided. SQLite is not implemented in this repository.");
+  }
+  if (stateKind === "postgres") {
+    if (postgresConnectionString === undefined) {
+      issues.push("state.connection_string must be provided when state.kind is postgres.");
+    } else if (!/^postgres(?:ql)?:\/\//.test(postgresConnectionString)) {
+      issues.push("state.connection_string must use postgres:// or postgresql://.");
+    }
+    if (!Number.isFinite(postgresLockTtlSeconds) || postgresLockTtlSeconds < 1) {
+      issues.push("state.lock_ttl_seconds must be greater than or equal to 1 when provided.");
+    }
+  }
   if (cloneDir.includes("/") || cloneDir.includes("\\") || cloneDir === "." || cloneDir === "..") {
     issues.push("repository.clone_dir must be a single directory name.");
   }
@@ -81,7 +98,7 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
     issues.push("limits.max_concurrency must be an integer greater than or equal to 1.");
   }
   if (maxConcurrency !== undefined && maxConcurrency !== 1) {
-    issues.push("limits.max_concurrency must remain 1 until real runners are implemented.");
+    issues.push("limits.max_concurrency must remain 1 until parallel orchestration is implemented.");
   }
   if (!Number.isFinite(pollIntervalSeconds) || pollIntervalSeconds < 1) {
     issues.push("daemon.poll_interval_seconds must be greater than or equal to 1 when provided.");
@@ -107,6 +124,15 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
     version: 1,
     workflowPath: path.resolve(workflowPath),
     tracker: trackerConfig!,
+    state: stateKind === "postgres"
+      ? {
+          kind: "postgres",
+          connectionString: postgresConnectionString!,
+          lockTtlSeconds: postgresLockTtlSeconds
+        }
+      : {
+          kind: "memory"
+        },
     workspace: {
       root: path.resolve(baseDir, workspaceRoot!)
     },

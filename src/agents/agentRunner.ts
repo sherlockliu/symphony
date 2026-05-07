@@ -1,5 +1,12 @@
 import type { AgentRunRequest, AgentRunResult } from "../types.js";
 
+export interface AgentCapabilities {
+  canEditFiles: boolean;
+  canRunCommands: boolean;
+  canCreateCommits: boolean;
+  canOpenPullRequests: boolean;
+}
+
 /**
  * Runs a coding agent against one prepared issue workspace.
  *
@@ -16,5 +23,6 @@ import type { AgentRunRequest, AgentRunResult } from "../types.js";
  */
 export interface AgentRunner {
   readonly kind: string;
+  readonly capabilities?: AgentCapabilities;
   run(request: AgentRunRequest): Promise<AgentRunResult>;
 }

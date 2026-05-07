@@ -6,7 +6,7 @@ import type { Issue, IssueRunSummary, WorkflowConfig } from "../types.js";
 import { isActiveRunState, type IssueRunLifecycleState, type IssueRunState } from "../state/runStateStore.js";
 
 export type DashboardMode = "daemon";
-export type DashboardRunState = IssueRunLifecycleState | "active";
+export type DashboardRunState = IssueRunLifecycleState | "active" | "failed";
 
 export interface DashboardRunView {
   issueIdentifier: string;
@@ -56,6 +56,10 @@ export interface DashboardConfigSummary {
     kind: "gh";
     remote: string;
     draft: true;
+  };
+  state: {
+    kind: WorkflowConfig["state"]["kind"];
+    lockTtlSeconds?: number;
   };
   daemon: {
     pollIntervalSeconds: number;
@@ -113,13 +117,13 @@ export class DashboardStatusStore {
     const now = this.nowIso();
     this.runs.set(state.issueIdentifier, {
       issueIdentifier: state.issueIdentifier,
-      issueId: state.issueId,
+      issueId: state.trackerIssueId,
       status: state.state,
       trackerKind: this.config.tracker.kind,
       agentKind: this.config.agent.kind,
       workspacePath: state.workspacePath === null ? null : safeWorkspacePath(this.config.workspace.root, state.workspacePath),
       prUrl: state.pullRequestUrl,
-      lastError: state.lastError,
+      lastError: state.lastErrorMessage ?? state.lastErrorType,
       startedAt: state.startedAt,
       completedAt: state.completedAt,
       updatedAt: state.updatedAt || now
@@ -203,7 +207,11 @@ export class DashboardStatusStore {
     return {
       active: runs.filter((run) => run.status === "active" || isActiveRunState(run.status as IssueRunLifecycleState)),
       succeeded: runs.filter((run) => run.status === "succeeded"),
-      failed: runs.filter((run) => run.status === "failed" || run.status === "needs_human_attention")
+      failed: runs.filter((run) =>
+        run.status === "failed_retryable"
+        || run.status === "failed_terminal"
+        || run.status === "needs_human_attention"
+      )
     };
   }
 
@@ -227,6 +235,14 @@ export class DashboardStatusStore {
         remote: this.config.github.remote,
         draft: this.config.github.draft
       },
+      state: this.config.state.kind === "postgres"
+        ? {
+            kind: "postgres",
+            lockTtlSeconds: this.config.state.lockTtlSeconds
+          }
+        : {
+            kind: "memory"
+          },
       daemon: {
         pollIntervalSeconds: this.config.daemon?.pollIntervalSeconds ?? 60
       },

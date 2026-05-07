@@ -8,6 +8,12 @@ import type { DryRunAgentConfig } from "./registry.js";
 
 export class DryRunRunner implements AgentRunner {
   readonly kind = "dry-run";
+  readonly capabilities = {
+    canEditFiles: false,
+    canRunCommands: false,
+    canCreateCommits: false,
+    canOpenPullRequests: false
+  };
 
   constructor(private readonly config: DryRunAgentConfig) {}
 
@@ -30,9 +36,11 @@ export class DryRunRunner implements AgentRunner {
     return {
       success: true,
       runner: this.kind,
+      summary: "Dry-run captured the rendered prompt without executing an external process.",
       exitCode: 0,
       timedOut: false,
       logPath,
+      logsPath: logPath,
       stdout,
       stderr
     };

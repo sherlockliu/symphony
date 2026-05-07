@@ -10,6 +10,7 @@ export interface ProcessRequest {
   input: string;
   timeoutMs: number;
   logPath: string;
+  env?: Record<string, string>;
 }
 
 export interface ProcessResult {
@@ -30,6 +31,7 @@ export class NodeProcessExecutor implements ProcessExecutor {
     return await new Promise<ProcessResult>((resolve, reject) => {
       const child = spawn(request.command, request.args, {
         cwd: request.cwd,
+        env: request.env === undefined ? process.env : { ...process.env, ...request.env },
         stdio: ["pipe", "pipe", "pipe"]
       });
 

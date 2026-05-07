@@ -1,7 +1,7 @@
 import type { Issue } from "../types.js";
 import type { IssueRunState } from "../state/runStateStore.js";
 import type { JiraTrackerConfig } from "./registry.js";
-import type { TrackerAdapter } from "./tracker.js";
+import type { TrackerAdapter, TrackerCapabilities } from "./tracker.js";
 
 type JiraConfig = JiraTrackerConfig;
 
@@ -42,6 +42,13 @@ interface JiraTransitionResponse {
 }
 
 export class JiraTracker implements TrackerAdapter {
+  readonly capabilities: TrackerCapabilities = {
+    canComment: true,
+    canTransition: true,
+    canFetchByQuery: true,
+    canFetchByLabel: false
+  };
+
   constructor(
     private readonly config: JiraConfig,
     private readonly httpClient: HttpClient = defaultHttpClient
@@ -95,7 +102,7 @@ export class JiraTracker implements TrackerAdapter {
       method: "POST",
       body: {
         body: adfText(
-          `Symphony needs human attention after ${state.attemptNumber} attempt(s). Last error: ${state.lastError ?? "unknown"}.`
+          `Symphony needs human attention after ${state.attemptCount} attempt(s). Last error: ${state.lastErrorMessage ?? state.lastErrorType ?? "unknown"}.`
         )
       }
     });

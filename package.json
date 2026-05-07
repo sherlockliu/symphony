@@ -17,7 +17,9 @@
     "dry-run:mock": "npm run build && node dist/src/cli/index.js dry-run examples/WORKFLOW.quickstart.mock.md",
     "daemon:mock": "npm run build && node dist/src/cli/index.js daemon examples/WORKFLOW.dashboard.mock.example.md",
     "daemon:mock:once": "npm run build && node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cycles 1",
+    "validate:examples": "npm run build && node --test dist/tests/examples.test.js",
     "docker:build": "docker build -t owned-symphony:local .",
+    "docker:validate": "npm run docker:build && mkdir -p config workspaces logs && cp examples/WORKFLOW.docker.mock.example.md config/WORKFLOW.md && cp examples/mock-issues.json config/mock-issues.json && docker compose run --rm orchestrator validate /config/WORKFLOW.md",
     "docker:dry-run": "npm run docker:build && mkdir -p config workspaces logs && cp examples/WORKFLOW.docker.mock.example.md config/WORKFLOW.md && cp examples/mock-issues.json config/mock-issues.json && docker compose run --rm orchestrator dry-run /config/WORKFLOW.md"
   },
   "engines": {

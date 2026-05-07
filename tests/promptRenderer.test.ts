@@ -22,6 +22,7 @@ const config: WorkflowConfig = {
   version: 1,
   workflowPath: "/tmp/WORKFLOW.md",
   tracker: { kind: "mock", issueFile: "/tmp/issues.json" },
+  state: { kind: "memory" },
   workspace: { root: "/tmp/workspaces" },
   repository: { url: "https://github.com/example/project.git", baseBranch: "main", cloneDir: "repo" },
   branch: { prefix: "symphony" },

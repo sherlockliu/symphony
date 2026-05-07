@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { loadWorkflow } from "../workflow/load.js";
 import { redactSecrets } from "../logging/redact.js";
-import { filterActiveIssues } from "../trackers/mockTracker.js";
+import { filterActiveIssues } from "../trackers/tracker.js";
 import { renderPrompt } from "../templates/promptRenderer.js";
 import { GitService } from "../git/gitService.js";
 import { WorkspaceManager } from "../workspaces/workspaceManager.js";
@@ -11,7 +11,8 @@ import { Orchestrator } from "../orchestrator/orchestrator.js";
 import { PollingDaemon } from "../daemon/pollingDaemon.js";
 import { DashboardStatusStore, isDashboardLocalHost } from "../dashboard/statusStore.js";
 import { startDashboardServer, type RunningDashboardServer } from "../dashboard/server.js";
-import { InMemoryRunStateStore } from "../state/runStateStore.js";
+import { createRunStateStore } from "../state/createRunStateStore.js";
+import { isStaleRecoverableState } from "../state/runStateStore.js";
 import type { WorkflowConfig } from "../types.js";
 
 type Command = "validate" | "dry-run" | "run" | "daemon";
@@ -62,6 +63,7 @@ async function validateCommand(workflowPath: string): Promise<void> {
     branchPrefix: config.branch.prefix,
     agent: config.agent,
     github: config.github,
+    state: redactStateForOutput(config.state),
     daemon: config.daemon,
     dashboard: config.dashboard,
     retry: config.retry,
@@ -103,7 +105,8 @@ async function dryRunCommand(workflowPath: string): Promise<void> {
 
 async function runCommand(workflowPath: string): Promise<void> {
   const { definition, config } = await loadWorkflow(workflowPath);
-  const result = await new Orchestrator(definition, config).runOnce({
+  const runStateStore = await createRunStateStore(config);
+  const result = await new Orchestrator(definition, config, { stateStore: runStateStore }).runOnce({
     onWarning: (message) => {
       console.error(redactSecrets(`Warning: ${message}`));
     }
@@ -125,7 +128,11 @@ async function daemonCommand(workflowPath: string, cliOptions: CliOptions = {}):
   const { definition, config } = await loadWorkflow(workflowPath);
   const abortController = new AbortController();
   const statusStore = new DashboardStatusStore(config);
-  const runStateStore = new InMemoryRunStateStore();
+  const runStateStore = await createRunStateStore(config);
+  const unfinishedBeforeRecovery = await runStateStore.listUnfinished();
+  const staleBeforeRecovery = unfinishedBeforeRecovery.filter((state) => isStaleRecoverableState(state.state));
+  await runStateStore.markStaleRuns(new Date());
+  const firstCycleExcludeIssueIds = new Set(staleBeforeRecovery.map((state) => state.trackerIssueId));
   let dashboardServer: RunningDashboardServer | null = null;
   const stop = (): void => {
     abortController.abort();
@@ -149,10 +156,19 @@ async function daemonCommand(workflowPath: string, cliOptions: CliOptions = {}):
       }));
     }
 
+    console.log(redactSecrets({
+      status: "startup_recovery",
+      state: redactStateForOutput(config.state),
+      unfinishedRuns: unfinishedBeforeRecovery.length,
+      recoveredStaleRuns: staleBeforeRecovery.length,
+      firstCycleExcludedIssues: firstCycleExcludeIssueIds.size
+    }));
+
     const daemon = new PollingDaemon(new Orchestrator(definition, config, { stateStore: runStateStore }), {
       pollIntervalMs: (config.daemon?.pollIntervalSeconds ?? 60) * 1000,
       signal: abortController.signal,
       maxCycles: cliOptions.maxCycles,
+      firstCycleExcludeIssueIds,
       onRunStateUpdated: (state) => {
         statusStore.recordRunState(state);
       },
@@ -246,7 +262,31 @@ function redactTrackerForOutput(tracker: WorkflowConfig["tracker"]): Record<stri
       reviewState: tracker.reviewState
     };
   }
+  if (tracker.kind === "github-issues") {
+    return {
+      kind: tracker.kind,
+      owner: tracker.owner,
+      repo: tracker.repo,
+      token: "[REDACTED]",
+      labels: tracker.labels,
+      humanReviewLabel: tracker.humanReviewLabel,
+      closedStates: tracker.closedStates,
+      removeCandidateLabelsOnReview: tracker.removeCandidateLabelsOnReview,
+      maxResults: tracker.maxResults
+    };
+  }
   return { ...tracker };
+}
+
+function redactStateForOutput(state: WorkflowConfig["state"]): Record<string, unknown> {
+  if (state.kind === "postgres") {
+    return {
+      kind: "postgres",
+      connectionString: "[REDACTED]",
+      lockTtlSeconds: state.lockTtlSeconds
+    };
+  }
+  return { kind: "memory" };
 }
 
 main(process.argv.slice(2)).then((code) => {

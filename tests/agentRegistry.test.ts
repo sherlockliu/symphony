@@ -1,4 +1,5 @@
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Orchestrator } from "../src/orchestrator/orchestrator.js";
@@ -40,7 +41,13 @@ test("a custom agent runner can be registered and used without changing orchestr
 
   registerAgentRunner<ExampleAgentConfig>({
     kind: customKind,
-    validate(raw, context) {
+    capabilities: {
+      canEditFiles: true,
+      canRunCommands: true,
+      canCreateCommits: false,
+      canOpenPullRequests: false
+    },
+    validateConfig(raw, context) {
       const timeoutSeconds = requiredNumber(raw.timeoutSeconds, "agent.timeout_seconds", context.issues);
       const logDir = requiredString(raw.logDir, "agent.log_dir", context.issues);
       const executable = requiredString(raw.executable, "agent.executable", context.issues);
@@ -62,9 +69,11 @@ test("a custom agent runner can be registered and used without changing orchestr
           return {
             success: true,
             runner: config.kind,
+            summary: "ok",
             exitCode: 0,
             timedOut: false,
             logPath: path.join(request.logDir, `${request.issue.identifier}-example.log`),
+            logsPath: path.join(request.logDir, `${request.issue.identifier}-example.log`),
             stdout: "ok",
             stderr: ""
           };
@@ -128,6 +137,14 @@ test("a custom agent runner can be registered and used without changing orchestr
   assert.equal(requests[0]!.timeoutSeconds, 45);
   assert.equal(requests[0]!.logDir, "/repo/examples/logs");
   assert.match(requests[0]!.prompt, /Run AGENT-1/);
+});
+
+test("orchestrator core does not import concrete agent runners", async () => {
+  const source = await readFile("src/orchestrator/orchestrator.ts", "utf8");
+
+  assert.equal(source.includes("codexRunner"), false);
+  assert.equal(source.includes("dryRunRunner"), false);
+  assert.equal(source.includes("shellRunner"), false);
 });
 
 function trackerWith(issues: Issue[]): TrackerAdapter {
