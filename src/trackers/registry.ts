@@ -7,33 +7,37 @@ import {
   type TrackerCapabilityRequirements
 } from "./tracker.js";
 import { GitHubIssuesTracker } from "./githubIssuesTracker.js";
-import { JiraTracker } from "./jiraTracker.js";
+import { JiraTrackerAdapter } from "./jiraTracker.js";
 import { MockTracker } from "./mockTracker.js";
-import { PlaneTracker } from "./planeTracker.js";
+import { PlaneTrackerAdapter } from "./planeTracker.js";
 
 export interface MockTrackerConfig {
   kind: "mock";
   issueFile: string;
+  eventsFile?: string;
+  readyStates?: string[];
   requiredCapabilities?: TrackerCapabilityRequirements;
 }
 
 export interface JiraTrackerConfig {
   kind: "jira";
   baseUrl: string;
-  email: string;
-  apiToken: string;
+  emailEnv: string;
+  apiTokenEnv: string;
   jql: string;
+  readyStates: string[];
   maxResults: number;
-  reviewTransition: string;
+  reviewState: string;
   requiredCapabilities?: TrackerCapabilityRequirements;
 }
 
 export interface PlaneTrackerConfig {
   kind: "plane";
   baseUrl: string;
-  apiKey: string;
+  apiTokenEnv: string;
   workspaceSlug: string;
   projectId: string;
+  readyStates: string[];
   maxResults: number;
   reviewState: string;
   requiredCapabilities?: TrackerCapabilityRequirements;
@@ -155,23 +159,33 @@ export function registeredTrackerKinds(): string[] {
 registerTracker<MockTrackerConfig>({
   kind: "mock",
   capabilities: {
-    canComment: false,
-    canTransition: false,
+    canComment: true,
+    canTransition: true,
     canFetchByQuery: false,
     canFetchByLabel: false
   },
   validateConfig(raw, context) {
-    const issueFile = stringAt(raw, "issueFile", context.issues, "tracker.issue_file");
+    const issueFile =
+      optionalStringAt(raw, "issuesFile", context.issues, "tracker.issues_file") ??
+      stringAt(raw, "issueFile", context.issues, "tracker.issue_file");
+    const eventsFile = optionalStringAt(raw, "eventsFile", context.issues, "tracker.events_file");
+    const readyStates = optionalStringArrayAt(raw, "readyStates", context.issues, "tracker.ready_states");
     if (issueFile === undefined) {
       return undefined;
     }
     return {
       kind: "mock",
-      issueFile: path.resolve(context.baseDir, issueFile)
+      issueFile: path.resolve(context.baseDir, issueFile),
+      eventsFile: eventsFile === undefined ? undefined : path.resolve(context.baseDir, eventsFile),
+      readyStates
     };
   },
   create(config) {
-    return new MockTracker(config.issueFile);
+    return new MockTracker({
+      issuesFile: config.issueFile,
+      eventsFile: config.eventsFile,
+      readyStates: config.readyStates
+    });
   }
 });
 
@@ -185,31 +199,35 @@ registerTracker<JiraTrackerConfig>({
   },
   validateConfig(raw, context) {
     const baseUrl = stringAt(raw, "baseUrl", context.issues, "tracker.base_url");
-    const email = stringAt(raw, "email", context.issues, "tracker.email");
-    const apiToken = stringAt(raw, "apiToken", context.issues, "tracker.api_token");
+    const emailEnv = stringAt(raw, "emailEnv", context.issues, "tracker.email_env");
+    const apiTokenEnv = stringAt(raw, "apiTokenEnv", context.issues, "tracker.api_token_env");
     const jql = stringAt(raw, "jql", context.issues, "tracker.jql");
+    const readyStates = optionalStringArrayAt(raw, "readyStates", context.issues, "tracker.ready_states") ?? [];
     const maxResults = optionalNumberAt(raw, "maxResults", context.issues, "tracker.max_results") ?? 50;
-    const reviewTransition =
-      optionalStringAt(raw, "reviewTransition", context.issues, "tracker.review_transition") ?? "Human Review";
+    const reviewState =
+      optionalStringAt(raw, "reviewState", context.issues, "tracker.review_state") ??
+      optionalStringAt(raw, "reviewTransition", context.issues, "tracker.review_transition") ??
+      "Human Review";
 
     if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 100) {
       context.issues.push("tracker.max_results must be an integer between 1 and 100.");
     }
-    if (baseUrl === undefined || email === undefined || apiToken === undefined || jql === undefined) {
+    if (baseUrl === undefined || emailEnv === undefined || apiTokenEnv === undefined || jql === undefined) {
       return undefined;
     }
     return {
       kind: "jira",
       baseUrl,
-      email,
-      apiToken,
+      emailEnv,
+      apiTokenEnv,
       jql,
+      readyStates,
       maxResults,
-      reviewTransition
+      reviewState
     };
   },
   create(config) {
-    return new JiraTracker(config);
+    return new JiraTrackerAdapter(config);
   }
 });
 
@@ -223,30 +241,32 @@ registerTracker<PlaneTrackerConfig>({
   },
   validateConfig(raw, context) {
     const baseUrl = stringAt(raw, "baseUrl", context.issues, "tracker.base_url");
-    const apiKey = stringAt(raw, "apiKey", context.issues, "tracker.api_key");
+    const apiTokenEnv = stringAt(raw, "apiTokenEnv", context.issues, "tracker.api_token_env");
     const workspaceSlug = stringAt(raw, "workspaceSlug", context.issues, "tracker.workspace_slug");
     const projectId = stringAt(raw, "projectId", context.issues, "tracker.project_id");
+    const readyStates = optionalStringArrayAt(raw, "readyStates", context.issues, "tracker.ready_states") ?? [];
     const maxResults = optionalNumberAt(raw, "maxResults", context.issues, "tracker.max_results") ?? 50;
     const reviewState = optionalStringAt(raw, "reviewState", context.issues, "tracker.review_state") ?? "Human Review";
 
     if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 100) {
       context.issues.push("tracker.max_results must be an integer between 1 and 100.");
     }
-    if (baseUrl === undefined || apiKey === undefined || workspaceSlug === undefined || projectId === undefined) {
+    if (baseUrl === undefined || apiTokenEnv === undefined || workspaceSlug === undefined || projectId === undefined) {
       return undefined;
     }
     return {
       kind: "plane",
       baseUrl,
-      apiKey,
+      apiTokenEnv,
       workspaceSlug,
       projectId,
+      readyStates,
       maxResults,
       reviewState
     };
   },
   create(config) {
-    return new PlaneTracker(config);
+    return new PlaneTrackerAdapter(config);
   }
 });
 

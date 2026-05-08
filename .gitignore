@@ -1,4 +1,10 @@
 node_modules/
 dist/
+dist-ui/
 .symphony/
+.orchestrator/
+config/
+data/
+logs/
+workspaces/
 *.log

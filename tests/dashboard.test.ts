@@ -40,11 +40,12 @@ test("DashboardStatusStore config summary omits tracker and provider secrets", (
     tracker: {
       kind: "jira",
       baseUrl: "https://example.atlassian.net",
-      email: "bot@example.com",
-      apiToken: "jira-secret-token",
+      emailEnv: "JIRA_EMAIL",
+      apiTokenEnv: "JIRA_API_TOKEN",
       jql: "project = ENG",
+      readyStates: ["Ready for AI"],
       maxResults: 50,
-      reviewTransition: "Human Review"
+      reviewState: "Human Review"
     },
     agent: {
       kind: "codex",

@@ -36,7 +36,11 @@ export class ShellRunner implements AgentRunner {
       input: promptInput.stdin,
       timeoutMs: this.config.timeoutSeconds * 1000,
       logPath: primaryLogPath,
-      env: this.config.env
+      env: this.config.env,
+      workspaceRoot: request.workspace.path,
+      allowedCommands: request.allowedCommands,
+      blockedCommands: request.blockedCommands,
+      guardCommand: this.config.command
     });
 
     await writeFile(stdoutLogPath, redactSecrets(result.stdout), "utf8");

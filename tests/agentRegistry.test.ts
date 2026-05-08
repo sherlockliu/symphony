@@ -143,6 +143,7 @@ test("orchestrator core does not import concrete agent runners", async () => {
   const source = await readFile("src/orchestrator/orchestrator.ts", "utf8");
 
   assert.equal(source.includes("codexRunner"), false);
+  assert.equal(source.includes("claudeCodeRunner"), false);
   assert.equal(source.includes("dryRunRunner"), false);
   assert.equal(source.includes("shellRunner"), false);
 });

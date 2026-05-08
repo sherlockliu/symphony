@@ -1,5 +1,6 @@
 import type { Issue } from "../types.js";
 import type { IssueRunState } from "../state/runStateStore.js";
+import { redactSecrets } from "../logging/redact.js";
 import type { JiraTrackerConfig } from "./registry.js";
 import type { TrackerAdapter, TrackerCapabilities } from "./tracker.js";
 
@@ -41,18 +42,28 @@ interface JiraTransitionResponse {
   }>;
 }
 
-export class JiraTracker implements TrackerAdapter {
+export class JiraTrackerAdapter implements TrackerAdapter {
   readonly capabilities: TrackerCapabilities = {
     canComment: true,
     canTransition: true,
     canFetchByQuery: true,
     canFetchByLabel: false
   };
+  private readonly email: string;
+  private readonly apiToken: string;
 
   constructor(
     private readonly config: JiraConfig,
-    private readonly httpClient: HttpClient = defaultHttpClient
-  ) {}
+    private readonly httpClient: HttpClient = defaultHttpClient,
+    env: NodeJS.ProcessEnv = process.env
+  ) {
+    this.email = resolveSecret(config.emailEnv, env, "Jira email");
+    this.apiToken = resolveSecret(config.apiTokenEnv, env, "Jira API token");
+  }
+
+  async fetchCandidateIssues(): Promise<Issue[]> {
+    return await this.listIssues();
+  }
 
   async listIssues(): Promise<Issue[]> {
     const issues: JiraIssuePayload[] = [];
@@ -85,44 +96,65 @@ export class JiraTracker implements TrackerAdapter {
       nextPageToken = response.nextPageToken;
     } while (nextPageToken !== undefined);
 
-    return issues.map((issue) => normalizeJiraIssue(issue, this.config.baseUrl));
+    const normalized = issues.map((issue) => normalizeJiraIssue(issue, this.config.baseUrl));
+    if (this.config.readyStates.length === 0) {
+      return normalized;
+    }
+    const ready = new Set(this.config.readyStates);
+    return normalized.filter((issue) => ready.has(issue.state));
+  }
+
+  async fetchIssue(id: string): Promise<Issue> {
+    const issue = await this.requestJson<JiraIssuePayload>(`/rest/api/3/issue/${encodeURIComponent(id)}`, {
+      method: "GET"
+    });
+    return normalizeJiraIssue(issue, this.config.baseUrl);
+  }
+
+  async commentOnIssue(id: string, body: string): Promise<void> {
+    await this.requestJson(`/rest/api/3/issue/${encodeURIComponent(id)}/comment`, {
+      method: "POST",
+      body: {
+        body: adfText(body)
+      }
+    });
   }
 
   async addPullRequestComment(issue: Issue, prUrl: string): Promise<void> {
-    await this.requestJson(`/rest/api/3/issue/${encodeURIComponent(issue.identifier)}/comment`, {
-      method: "POST",
-      body: {
-        body: adfText(`Draft PR created by Symphony: ${prUrl}`)
-      }
-    });
+    await this.commentOnIssue(issue.identifier, `Draft PR created by Symphony: ${prUrl}`);
   }
 
   async addNeedsHumanAttentionComment(issue: Issue, state: IssueRunState): Promise<void> {
-    await this.requestJson(`/rest/api/3/issue/${encodeURIComponent(issue.identifier)}/comment`, {
-      method: "POST",
-      body: {
-        body: adfText(
-          `Symphony needs human attention after ${state.attemptCount} attempt(s). Last error: ${state.lastErrorMessage ?? state.lastErrorType ?? "unknown"}.`
-        )
-      }
-    });
+    await this.commentOnIssue(
+      issue.identifier,
+      `Symphony needs human attention after ${state.attemptCount} attempt(s). Last error: ${state.lastErrorMessage ?? state.lastErrorType ?? "unknown"}.`
+    );
   }
 
   async transitionToHumanReview(issue: Issue): Promise<void> {
+    await this.transitionIssue(issue.identifier, this.config.reviewState);
+  }
+
+  async transitionIssue(id: string, targetState: string): Promise<void> {
     const transitions = await this.requestJson<JiraTransitionResponse>(
-      `/rest/api/3/issue/${encodeURIComponent(issue.identifier)}/transitions`,
+      `/rest/api/3/issue/${encodeURIComponent(id)}/transitions`,
       { method: "GET" }
     );
-    const desired = this.config.reviewTransition.toLowerCase();
-    const transition = (transitions.transitions ?? []).find((candidate) => {
+    const desired = targetState.toLowerCase();
+    const matches = (transitions.transitions ?? []).filter((candidate) => {
       return candidate.name.toLowerCase() === desired || candidate.to?.name?.toLowerCase() === desired;
     });
 
-    if (transition === undefined) {
-      throw new Error(`Jira transition ${this.config.reviewTransition} is not available for ${issue.identifier}.`);
+    if (matches.length === 0) {
+      throw new Error(`Jira transition ${targetState} is not available for ${id}.`);
     }
+    if (matches.length > 1) {
+      const names = matches.map((candidate) => `${candidate.name} (${candidate.id})`).join(", ");
+      throw new Error(`Jira transition ${targetState} is ambiguous for ${id}: ${names}.`);
+    }
+    const transition = matches[0]!;
 
-    await this.requestJson(`/rest/api/3/issue/${encodeURIComponent(issue.identifier)}/transitions`, {
+    await this.requestJson(`/rest/api/3/issue/${encodeURIComponent(id)}/transitions`, {
       method: "POST",
       body: {
         transition: {
@@ -136,20 +168,26 @@ export class JiraTracker implements TrackerAdapter {
     path: string,
     options: { method: string; body?: unknown }
   ): Promise<T> {
-    const response = await this.httpClient({
-      method: options.method,
-      url: `${this.config.baseUrl.replace(/\/+$/, "")}${path}`,
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        Authorization: `Basic ${Buffer.from(`${this.config.email}:${this.config.apiToken}`).toString("base64")}`
-      },
-      body: options.body === undefined ? undefined : JSON.stringify(options.body)
-    });
+    let response: HttpResponse;
+    try {
+      response = await this.httpClient({
+        method: options.method,
+        url: `${this.config.baseUrl.replace(/\/+$/, "")}${path}`,
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(`${this.email}:${this.apiToken}`).toString("base64")}`
+        },
+        body: options.body === undefined ? undefined : JSON.stringify(options.body)
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(redactSecrets(`Jira request failed: ${message}`));
+    }
 
     const text = await response.text();
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Jira request failed with HTTP ${response.status}: ${text}`);
+      throw new Error(redactSecrets(`Jira request failed with HTTP ${response.status}: ${text}`));
     }
     if (text.trim().length === 0) {
       return undefined as T;
@@ -157,6 +195,8 @@ export class JiraTracker implements TrackerAdapter {
     return JSON.parse(text) as T;
   }
 }
+
+export class JiraTracker extends JiraTrackerAdapter {}
 
 function normalizeJiraIssue(issue: JiraIssuePayload, baseUrl: string): Issue {
   const fields = issue.fields ?? {};
@@ -169,14 +209,15 @@ function normalizeJiraIssue(issue: JiraIssuePayload, baseUrl: string): Issue {
     identifier: issue.key,
     title: stringField(fields.summary) ?? issue.key,
     description: adfToText(fields.description),
-    priority: priorityNumber(priority),
+    priority: stringField(priority?.name) ?? null,
     state: stringField(status?.name) ?? "Unknown",
     branchName: null,
     url: `${baseUrl.replace(/\/+$/, "")}/browse/${issue.key}`,
-    labels: labels.map((label) => label.toLowerCase()),
+    labels,
     blockedBy: normalizeBlockers(fields.issuelinks),
     createdAt: stringField(fields.created) ?? null,
-    updatedAt: stringField(fields.updated) ?? null
+    updatedAt: stringField(fields.updated) ?? null,
+    raw: issue
   };
 }
 
@@ -269,19 +310,23 @@ function adfText(text: string) {
   };
 }
 
-function priorityNumber(priority: Record<string, unknown> | undefined): number | null {
-  const id = stringField(priority?.id);
-  if (id !== undefined && /^\d+$/.test(id)) {
-    return Number(id);
-  }
-  return null;
-}
-
 function objectField(value: unknown): Record<string, unknown> | undefined {
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
   }
   return undefined;
+}
+
+function resolveSecret(
+  envName: string,
+  env: NodeJS.ProcessEnv,
+  label: string
+): string {
+  const value = env[envName];
+  if (value === undefined || value.trim().length === 0) {
+    throw new Error(`${label} environment variable ${envName} is not set.`);
+  }
+  return value;
 }
 
 function arrayField(value: unknown): unknown[] {

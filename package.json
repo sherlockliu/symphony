@@ -10,6 +10,11 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
     "lint": "tsc -p tsconfig.json --noEmit",
+    "dev": "npm run build && node dist/src/cli/index.js",
+    "orchestrator": "npm run build && node dist/src/cli/index.js",
+    "api": "npm run build && node dist/src/cli/index.js api ./WORKFLOW.example.md",
+    "ui:dev": "vite --host 127.0.0.1",
+    "ui:build": "tsc -p ui/tsconfig.json && vite build",
     "validate": "npm run build && node dist/src/cli/index.js validate",
     "dry-run": "npm run build && node dist/src/cli/index.js dry-run",
     "daemon": "npm run build && node dist/src/cli/index.js daemon",
@@ -19,14 +24,27 @@
     "daemon:mock:once": "npm run build && node dist/src/cli/index.js daemon examples/WORKFLOW.quickstart.mock.md --max-cycles 1",
     "validate:examples": "npm run build && node --test dist/tests/examples.test.js",
     "docker:build": "docker build -t owned-symphony:local .",
-    "docker:validate": "npm run docker:build && mkdir -p config workspaces logs && cp examples/WORKFLOW.docker.mock.example.md config/WORKFLOW.md && cp examples/mock-issues.json config/mock-issues.json && docker compose run --rm orchestrator validate /config/WORKFLOW.md",
-    "docker:dry-run": "npm run docker:build && mkdir -p config workspaces logs && cp examples/WORKFLOW.docker.mock.example.md config/WORKFLOW.md && cp examples/mock-issues.json config/mock-issues.json && docker compose run --rm orchestrator dry-run /config/WORKFLOW.md"
+    "docker:validate": "npm run docker:build && mkdir -p config workspaces logs data && cp examples/WORKFLOW.docker.mock.example.md config/WORKFLOW.md && cp examples/mock-issues.json config/mock-issues.json && docker compose run --rm orchestrator-worker validate /config/WORKFLOW.md",
+    "docker:dry-run": "npm run docker:build && mkdir -p config workspaces logs data && cp examples/WORKFLOW.docker.mock.example.md config/WORKFLOW.md && cp examples/mock-issues.json config/mock-issues.json && docker compose run --rm orchestrator-worker dry-run /config/WORKFLOW.md"
   },
   "engines": {
     "node": ">=22"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
-    "typescript": "^5.8.3"
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "postcss": "^8.5.14",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.8.3",
+    "vite": "^8.0.11"
+  },
+  "dependencies": {
+    "fastify": "^5.8.5",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "zod": "^4.4.3"
   }
 }

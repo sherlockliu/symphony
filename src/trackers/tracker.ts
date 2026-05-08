@@ -48,8 +48,8 @@ export function validateTrackedIssue(issue: Issue, source = "tracker"): Issue {
   if (issue.description !== null && typeof issue.description !== "string") {
     problems.push("description must be a string or null");
   }
-  if (issue.priority !== null && typeof issue.priority !== "number") {
-    problems.push("priority must be a number or null");
+  if (issue.priority !== null && typeof issue.priority !== "number" && typeof issue.priority !== "string") {
+    problems.push("priority must be a string, number, or null");
   }
   if (issue.branchName !== null && typeof issue.branchName !== "string") {
     problems.push("branchName must be a string or null");

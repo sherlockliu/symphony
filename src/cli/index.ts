@@ -1,6 +1,10 @@
 #!/usr/bin/env node
+import path from "node:path";
+import { createHash } from "node:crypto";
 import { loadWorkflow } from "../workflow/load.js";
+import { loadWorkflowFromFile as loadCoreWorkflowFromFile } from "../workflow/workflowLoader.js";
 import { redactSecrets } from "../logging/redact.js";
+import { collectConfigWarnings } from "../security/configWarnings.js";
 import { filterActiveIssues } from "../trackers/tracker.js";
 import { renderPrompt } from "../templates/promptRenderer.js";
 import { GitService } from "../git/gitService.js";
@@ -8,17 +12,25 @@ import { WorkspaceManager } from "../workspaces/workspaceManager.js";
 import { GitHubPullRequestService } from "../github/pullRequestService.js";
 import { createTracker } from "../trackers/createTracker.js";
 import { Orchestrator } from "../orchestrator/orchestrator.js";
+import { Orchestrator as CoreOrchestrator } from "../core/orchestrator.js";
 import { PollingDaemon } from "../daemon/pollingDaemon.js";
 import { DashboardStatusStore, isDashboardLocalHost } from "../dashboard/statusStore.js";
 import { startDashboardServer, type RunningDashboardServer } from "../dashboard/server.js";
+import { startApiServer, type RunningApiServer } from "../server/api.js";
 import { createRunStateStore } from "../state/createRunStateStore.js";
 import { isStaleRecoverableState } from "../state/runStateStore.js";
 import type { WorkflowConfig } from "../types.js";
+import type { MvpWorkflow } from "../core/orchestrator.js";
+import type { WorkflowConfig as CoreWorkflowConfig } from "../core/domain.js";
 
-type Command = "validate" | "dry-run" | "run" | "daemon";
+type Command = "validate" | "dry-run" | "run" | "daemon" | "api";
 
 interface CliOptions {
   maxCycles?: number;
+  once?: boolean;
+  poll?: boolean;
+  host?: string;
+  port?: number;
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -39,7 +51,11 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     if (command === "run") {
-      await runCommand(workflowPath);
+      await runCommand(workflowPath, options);
+      return 0;
+    }
+    if (command === "api") {
+      await apiCommand(workflowPath, options);
       return 0;
     }
     await daemonCommand(workflowPath, options);
@@ -48,6 +64,37 @@ async function main(argv: string[]): Promise<number> {
     const message = error instanceof Error ? error.message : String(error);
     console.error(redactSecrets(message));
     return 1;
+  }
+}
+
+async function apiCommand(workflowPath: string, options: CliOptions = {}): Promise<void> {
+  const resolvedWorkflowPath = path.resolve(workflowPath);
+  const workflow = await loadWorkflowForApi(resolvedWorkflowPath);
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? 4001;
+  let server: RunningApiServer | null = null;
+  const stop = (): void => {
+    void server?.close().finally(() => process.exit(0));
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+
+  try {
+    server = await startApiServer({
+      workflow,
+      workflowPath: resolvedWorkflowPath,
+      baseDir: path.dirname(resolvedWorkflowPath),
+      staticUiDir: path.resolve(process.cwd(), "dist-ui")
+    }, { host, port });
+    console.log(redactSecrets({
+      status: "api_started",
+      url: server.url,
+      health: `${server.url}/api/health`
+    }));
+    await new Promise(() => {});
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
   }
 }
 
@@ -67,6 +114,8 @@ async function validateCommand(workflowPath: string): Promise<void> {
     daemon: config.daemon,
     dashboard: config.dashboard,
     retry: config.retry,
+    safety: config.safety,
+    warnings: collectConfigWarnings(config),
     maxConcurrency: config.limits.maxConcurrency
   }));
 }
@@ -103,8 +152,29 @@ async function dryRunCommand(workflowPath: string): Promise<void> {
   }
 }
 
-async function runCommand(workflowPath: string): Promise<void> {
-  const { definition, config } = await loadWorkflow(workflowPath);
+async function runCommand(workflowPath: string, options: CliOptions = {}): Promise<void> {
+  if (options.poll) {
+    await daemonCommand(workflowPath, options);
+    return;
+  }
+  if (options.once) {
+    await coreRunOnceCommand(workflowPath);
+    return;
+  }
+
+  let workflow: Awaited<ReturnType<typeof loadWorkflow>>;
+  try {
+    workflow = await loadWorkflow(workflowPath);
+  } catch (runtimeError) {
+    try {
+      await coreRunOnceCommand(workflowPath);
+      return;
+    } catch {
+      throw runtimeError;
+    }
+  }
+
+  const { definition, config } = workflow;
   const runStateStore = await createRunStateStore(config);
   const result = await new Orchestrator(definition, config, { stateStore: runStateStore }).runOnce({
     onWarning: (message) => {
@@ -122,6 +192,30 @@ async function runCommand(workflowPath: string): Promise<void> {
       message: "no active mock issues found"
     }));
   }
+}
+
+async function coreRunOnceCommand(workflowPath: string): Promise<void> {
+  const resolvedWorkflowPath = path.resolve(workflowPath);
+  const workflow = await loadCoreWorkflowFromFile(resolvedWorkflowPath);
+  const result = await new CoreOrchestrator(workflow, {
+    baseDir: path.dirname(resolvedWorkflowPath)
+  }).runOnce();
+
+  console.log(redactSecrets({
+    status: "completed",
+    mode: "core-mvp-once",
+    fetchedIssues: result.fetchedIssues,
+    eligibleIssues: result.eligibleIssues,
+    processedRuns: result.processedRuns.map((run) => ({
+      id: run.id,
+      issue: run.issueIdentifier,
+      status: run.status,
+      workspacePath: run.workspacePath,
+      branchName: run.branchName,
+      errorMessage: run.errorMessage
+    })),
+    runsFilePath: result.runsFilePath
+  }));
 }
 
 async function daemonCommand(workflowPath: string, cliOptions: CliOptions = {}): Promise<void> {
@@ -200,20 +294,26 @@ async function daemonCommand(workflowPath: string, cliOptions: CliOptions = {}):
 }
 
 function isCommand(value: string | undefined): value is Command {
-  return value === "validate" || value === "dry-run" || value === "run" || value === "daemon";
+  return value === "validate" || value === "dry-run" || value === "run" || value === "daemon" || value === "api";
 }
 
 function printUsage(): void {
   console.error([
-    "Usage: orchestrator <validate|dry-run|run|daemon> ./WORKFLOW.md [options]",
+    "Usage: orchestrator <validate|dry-run|run|daemon|api> ./WORKFLOW.md [options]",
     "",
     "Options:",
+    "  --once             Use the local MVP domain orchestrator for one dry-run cycle.",
+    "  --poll             Use the daemon polling loop from run mode.",
     "  --max-cycles <n>   Stop daemon mode after n polling cycles.",
+    "  --host <host>      Host for api mode. Defaults to 127.0.0.1.",
+    "  --port <port>      Port for api mode. Defaults to 4001.",
     "",
     "Examples:",
     "  orchestrator validate examples/WORKFLOW.quickstart.mock.md",
     "  orchestrator dry-run examples/WORKFLOW.quickstart.mock.md",
-    "  orchestrator daemon examples/WORKFLOW.dashboard.mock.example.md"
+    "  orchestrator run examples/WORKFLOW.quickstart.mock.md --poll",
+    "  orchestrator daemon examples/WORKFLOW.dashboard.mock.example.md",
+    "  orchestrator run ./WORKFLOW.example.md --once"
   ].join("\n"));
 }
 
@@ -234,6 +334,36 @@ function parseOptions(args: string[]): CliOptions {
       index += 1;
       continue;
     }
+    if (arg === "--once") {
+      options.once = true;
+      continue;
+    }
+    if (arg === "--poll") {
+      options.poll = true;
+      continue;
+    }
+    if (arg === "--host") {
+      const host = args[index + 1];
+      if (host === undefined || host.trim() === "") {
+        throw new Error("--host requires a non-empty value.");
+      }
+      options.host = host;
+      index += 1;
+      continue;
+    }
+    if (arg === "--port") {
+      const raw = args[index + 1];
+      if (raw === undefined) {
+        throw new Error("--port requires an integer value.");
+      }
+      const port = Number(raw);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error("--port must be an integer between 1 and 65535.");
+      }
+      options.port = port;
+      index += 1;
+      continue;
+    }
     throw new Error(`Unknown option: ${arg}. Run without arguments to see usage.`);
   }
   return options;
@@ -244,20 +374,22 @@ function redactTrackerForOutput(tracker: WorkflowConfig["tracker"]): Record<stri
     return {
       kind: tracker.kind,
       baseUrl: tracker.baseUrl,
-      email: tracker.email,
-      apiToken: "[REDACTED]",
+      emailEnv: tracker.emailEnv,
+      apiTokenEnv: tracker.apiTokenEnv,
       jql: tracker.jql,
+      readyStates: tracker.readyStates,
       maxResults: tracker.maxResults,
-      reviewTransition: tracker.reviewTransition
+      reviewState: tracker.reviewState
     };
   }
   if (tracker.kind === "plane") {
     return {
       kind: tracker.kind,
       baseUrl: tracker.baseUrl,
-      apiKey: "[REDACTED]",
+      apiTokenEnv: tracker.apiTokenEnv,
       workspaceSlug: tracker.workspaceSlug,
       projectId: tracker.projectId,
+      readyStates: tracker.readyStates,
       maxResults: tracker.maxResults,
       reviewState: tracker.reviewState
     };
@@ -286,7 +418,131 @@ function redactStateForOutput(state: WorkflowConfig["state"]): Record<string, un
       lockTtlSeconds: state.lockTtlSeconds
     };
   }
+  if (state.kind === "json") {
+    return {
+      kind: "json",
+      filePath: state.filePath
+    };
+  }
   return { kind: "memory" };
+}
+
+async function loadWorkflowForApi(workflowPath: string): Promise<MvpWorkflow> {
+  try {
+    return await loadCoreWorkflowFromFile(workflowPath);
+  } catch (coreError) {
+    try {
+      const runtimeWorkflow = await loadWorkflow(workflowPath);
+      return mvpWorkflowFromRuntime(runtimeWorkflow.definition.promptTemplate, runtimeWorkflow.config);
+    } catch {
+      throw coreError;
+    }
+  }
+}
+
+function mvpWorkflowFromRuntime(promptTemplate: string, config: WorkflowConfig): MvpWorkflow {
+  const coreConfig: CoreWorkflowConfig = {
+    tracker: coreTrackerFromRuntime(config.tracker),
+    repository: {
+      url: config.repository.url,
+      defaultBranch: config.repository.baseBranch,
+      branchNamePattern: `${config.branch.prefix}/{{ issue.identifier }}`
+    },
+    workspace: {
+      root: config.workspace.root,
+      cleanupPolicy: "never"
+    },
+    agent: {
+      kind: config.agent.kind,
+      command: "command" in config.agent && typeof config.agent.command === "string" ? config.agent.command : config.agent.kind,
+      maxConcurrentAgents: config.limits.maxConcurrency,
+      maxTurns: "maxTurns" in config.agent && typeof config.agent.maxTurns === "number" ? config.agent.maxTurns : 20,
+      timeoutSeconds: config.agent.timeoutSeconds
+    },
+    polling: {
+      enabled: true,
+      intervalSeconds: config.daemon?.pollIntervalSeconds ?? 60
+    },
+    states: {
+      eligible: config.states.active,
+      terminal: config.states.terminal,
+      humanReview: "reviewState" in config.tracker && typeof config.tracker.reviewState === "string"
+        ? config.tracker.reviewState
+        : "Human Review"
+    },
+    safety: {
+      requireHumanReview: true,
+      allowAutoMerge: false,
+      allowTicketTransitions: true,
+      allowPrCreation: true,
+      redactSecrets: true,
+      maxConcurrentRuns: config.limits.maxConcurrency
+    }
+  };
+  return {
+    config: coreConfig,
+    promptTemplate,
+    configHash: createHash("sha256").update(JSON.stringify(config)).digest("hex")
+  };
+}
+
+function coreTrackerFromRuntime(tracker: WorkflowConfig["tracker"]): CoreWorkflowConfig["tracker"] {
+  if (tracker.kind === "mock") {
+    const mock = tracker as { issueFile?: string; eventsFile?: string };
+    return {
+      kind: "mock",
+      issueFile: mock.issueFile,
+      issuesFile: mock.issueFile,
+      eventsFile: mock.eventsFile
+    };
+  }
+  if (tracker.kind === "jira") {
+    const jira = tracker as {
+      baseUrl: string;
+      emailEnv: string;
+      apiTokenEnv: string;
+      jql: string;
+      readyStates: string[];
+      reviewState: string;
+      maxResults?: number;
+    };
+    return {
+      kind: "jira",
+      baseUrl: jira.baseUrl,
+      emailEnv: jira.emailEnv,
+      apiTokenEnv: jira.apiTokenEnv,
+      jql: jira.jql,
+      readyStates: jira.readyStates,
+      reviewState: jira.reviewState,
+      maxResults: jira.maxResults
+    };
+  }
+  if (tracker.kind === "plane") {
+    const plane = tracker as {
+      baseUrl: string;
+      apiTokenEnv: string;
+      workspaceSlug: string;
+      projectId: string;
+      readyStates: string[];
+      reviewState: string;
+      maxResults?: number;
+    };
+    return {
+      kind: "plane",
+      baseUrl: plane.baseUrl,
+      apiTokenEnv: plane.apiTokenEnv,
+      workspaceSlug: plane.workspaceSlug,
+      projectId: plane.projectId,
+      readyStates: plane.readyStates,
+      reviewState: plane.reviewState,
+      maxResults: plane.maxResults
+    };
+  }
+  return {
+    kind: "mock",
+    issuesFile: undefined,
+    issueFile: undefined
+  };
 }
 
 main(process.argv.slice(2)).then((code) => {

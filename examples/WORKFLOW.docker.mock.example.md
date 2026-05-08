@@ -3,10 +3,14 @@ version: 1
 tracker:
   kind: mock
   issue_file: /config/mock-issues.json
+  events_file: /data/mock-tracker-events.json
+state:
+  kind: json
+  file_path: /data/run-state.json
 workspace:
   root: /workspaces
 repository:
-  url: /app
+  url: /config/template-repo
   base_branch: main
   clone_dir: repo
 branch:

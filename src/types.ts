@@ -54,11 +54,20 @@ export interface WorkflowConfig {
     host: string;
     port: number;
   };
+  safety?: {
+    allowAutoMerge: boolean;
+    allowedCommands: string[];
+    blockedCommands: string[];
+  };
 }
 
 export type StateConfig =
   | {
       kind: "memory";
+    }
+  | {
+      kind: "json";
+      filePath: string;
     }
   | {
       kind: "postgres";
@@ -71,7 +80,7 @@ export interface Issue {
   identifier: string;
   title: string;
   description: string | null;
-  priority: number | null;
+  priority: string | number | null;
   state: string;
   branchName: string | null;
   url: string | null;
@@ -83,6 +92,7 @@ export interface Issue {
   }>;
   createdAt: string | null;
   updatedAt: string | null;
+  raw?: unknown;
 }
 
 export interface IssueWorkspace {
@@ -99,6 +109,8 @@ export interface AgentRunRequest {
   workflowPath: string;
   timeoutSeconds: number;
   logDir: string;
+  allowedCommands?: string[];
+  blockedCommands?: string[];
 }
 
 export interface AgentRunResult {

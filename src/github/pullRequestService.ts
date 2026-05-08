@@ -103,7 +103,11 @@ export class GitHubPullRequestService implements PullRequestService {
       cwd: request.workspace.repoPath,
       input,
       timeoutMs: 120_000,
-      logPath
+      logPath,
+      workspaceRoot: request.workspace.path,
+      allowedCommands: this.config.safety?.allowedCommands,
+      blockedCommands: this.config.safety?.blockedCommands,
+      guardCommand: args[0]!
     });
 
     if (result.timedOut || result.exitCode !== 0) {

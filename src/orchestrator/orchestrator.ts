@@ -142,7 +142,9 @@ export class Orchestrator {
         prompt,
         workflowPath: this.config.workflowPath,
         timeoutSeconds: this.config.agent.timeoutSeconds,
-        logDir: this.config.agent.logDir
+        logDir: this.config.agent.logDir,
+        allowedCommands: this.config.safety?.allowedCommands,
+        blockedCommands: this.config.safety?.blockedCommands
       });
       state = await this.updateState(state, { logsPath: agentResult.logPath }, options);
       const pullRequestResult = agentResult.success

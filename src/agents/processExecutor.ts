@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { redactSecrets } from "../logging/redact.js";
+import { assertSafeCommandExecution } from "../security/commandGuard.js";
 
 export interface ProcessRequest {
   command: string;
@@ -11,6 +12,10 @@ export interface ProcessRequest {
   timeoutMs: number;
   logPath: string;
   env?: Record<string, string>;
+  workspaceRoot: string;
+  allowedCommands?: string[];
+  blockedCommands?: string[];
+  guardCommand?: string;
 }
 
 export interface ProcessResult {
@@ -26,6 +31,14 @@ export interface ProcessExecutor {
 
 export class NodeProcessExecutor implements ProcessExecutor {
   async execute(request: ProcessRequest): Promise<ProcessResult> {
+    assertSafeCommandExecution({
+      command: request.command,
+      cwd: request.cwd,
+      workspaceRoot: request.workspaceRoot,
+      allowedCommands: request.allowedCommands,
+      blockedCommands: request.blockedCommands,
+      displayCommand: request.guardCommand
+    });
     await mkdir(path.dirname(request.logPath), { recursive: true });
 
     return await new Promise<ProcessResult>((resolve, reject) => {

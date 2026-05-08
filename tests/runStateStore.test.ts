@@ -1,5 +1,9 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { JsonRunStateStore } from "../src/state/jsonRunStateStore.js";
 import { POSTGRES_MIGRATIONS } from "../src/state/postgresMigrations.js";
 import { PostgresRunStateStore, type SqlExecutor } from "../src/state/postgresRunStateStore.js";
 import {
@@ -64,6 +68,55 @@ test("markStaleRuns converts active runs to retryable or human-attention states"
 
   assert.equal((await store.getByIssueId("issue-1"))?.state, "failed_retryable");
   assert.equal((await store.getByIssueId("issue-2"))?.state, "needs_human_attention");
+});
+
+test("JsonRunStateStore persists run state across instances", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-json-state-"));
+  const filePath = path.join(root, "run-state.json");
+  try {
+    const now = new Date("2026-05-07T12:00:00.000Z");
+    const runState = {
+      ...createInitialRunState(issue, config({ state: { kind: "json", filePath } }), now.toISOString()),
+      state: "failed_retryable",
+      attemptCount: 1,
+      nextRetryAt: "2026-05-07T11:59:00.000Z"
+    } satisfies IssueRunState;
+
+    await new JsonRunStateStore(filePath).upsert(runState);
+    const restored = new JsonRunStateStore(filePath);
+
+    assert.equal((await restored.getByIssueId(issue.id))?.issueIdentifier, issue.identifier);
+    assert.equal((await restored.getByIssueIdentifier(issue.identifier))?.trackerIssueId, issue.id);
+    assert.equal((await restored.listRetryable(now)).length, 1);
+    assert.equal((await restored.listRecent(10)).length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("JsonRunStateStore lock and stale recovery behavior matches memory store", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-json-state-"));
+  const filePath = path.join(root, "run-state.json");
+  try {
+    const store = new JsonRunStateStore(filePath);
+    const runState = {
+      ...createInitialRunState(issue, config({ state: { kind: "json", filePath } }), "2026-05-07T12:00:00.000Z"),
+      state: "running_agent",
+      attemptCount: 1,
+      maxAttempts: 2
+    } satisfies IssueRunState;
+
+    await store.upsert(runState);
+    assert.equal(await store.acquireLock(runState, "worker-a", new Date(Date.now() + 300_000)), true);
+    assert.equal(await store.acquireLock(runState, "worker-b", new Date(Date.now() + 300_000)), false);
+
+    await store.markStaleRuns(new Date("2026-05-07T12:30:00.000Z"));
+    const recovered = await store.getByIssueId(issue.id);
+    assert.equal(recovered?.state, "failed_retryable");
+    assert.equal(recovered?.lockOwner, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Postgres migrations are idempotent and include duplicate-prevention indexes", () => {

@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { JsonValue } from "../types.js";
 import type { AgentCapabilities, AgentRunner } from "./agentRunner.js";
+import { ClaudeCodeRunner } from "./claudeCodeRunner.js";
 import { CodexRunner } from "./codexRunner.js";
 import { DryRunRunner } from "./dryRunRunner.js";
 import type { ProcessExecutor } from "./processExecutor.js";
@@ -18,7 +19,19 @@ export interface CodexAgentConfig {
   command: string;
   args: string[];
   timeoutSeconds: number;
+  maxTurns?: number;
   logDir: string;
+  savePrompt?: boolean;
+  dryRun?: boolean;
+}
+
+export interface ClaudeCodeAgentConfig {
+  kind: "claude-code";
+  command: string;
+  args: string[];
+  timeoutSeconds: number;
+  logDir: string;
+  env: Record<string, string>;
   savePrompt?: boolean;
 }
 
@@ -40,7 +53,7 @@ export interface CustomAgentConfig {
   [key: string]: unknown;
 }
 
-export type BuiltInAgentConfig = DryRunAgentConfig | CodexAgentConfig | ShellAgentConfig;
+export type BuiltInAgentConfig = DryRunAgentConfig | CodexAgentConfig | ClaudeCodeAgentConfig | ShellAgentConfig;
 export type AgentConfig = BuiltInAgentConfig | CustomAgentConfig;
 
 export interface AgentValidationContext {
@@ -166,18 +179,56 @@ registerAgentRunner<CodexAgentConfig>({
     const command = optionalStringAt(raw, "command", context.issues, "agent.command") ?? "codex";
     const args = optionalStringArrayAt(raw, "args", context.issues, "agent.args") ?? ["exec", "-"];
     const savePrompt = optionalBooleanAt(raw, "savePrompt", context.issues, "agent.save_prompt") ?? false;
+    const dryRun = optionalBooleanAt(raw, "dryRun", context.issues, "agent.dry_run") ?? false;
+    const maxTurns = optionalNumberAt(raw, "maxTurns", context.issues, "agent.max_turns");
     validateCommonAgentFields(timeoutSeconds, context.issues);
+    if (maxTurns !== undefined && (!Number.isInteger(maxTurns) || maxTurns < 1)) {
+      context.issues.push("agent.max_turns must be an integer greater than or equal to 1 when provided.");
+    }
     return {
       kind: "codex",
       command,
       args,
       timeoutSeconds,
+      maxTurns,
       logDir: path.resolve(context.baseDir, logDir),
-      savePrompt
+      savePrompt,
+      dryRun
     };
   },
   create(config, dependencies) {
     return new CodexRunner(config, dependencies?.executor);
+  }
+});
+
+registerAgentRunner<ClaudeCodeAgentConfig>({
+  kind: "claude-code",
+  capabilities: {
+    canEditFiles: true,
+    canRunCommands: true,
+    canCreateCommits: false,
+    canOpenPullRequests: false
+  },
+  validateConfig(raw, context) {
+    const timeoutSeconds = optionalNumberAt(raw, "timeoutSeconds", context.issues, "agent.timeout_seconds") ?? 900;
+    const logDir = optionalStringAt(raw, "logDir", context.issues, "agent.log_dir") ?? "logs";
+    const command = optionalStringAt(raw, "command", context.issues, "agent.command") ?? "claude";
+    const args = optionalStringArrayAt(raw, "args", context.issues, "agent.args") ?? ["-p"];
+    const env = optionalStringRecordAt(raw, "env", context.issues, "agent.env") ?? {};
+    const savePrompt = optionalBooleanAt(raw, "savePrompt", context.issues, "agent.save_prompt") ?? false;
+    validateCommonAgentFields(timeoutSeconds, context.issues);
+    return {
+      kind: "claude-code",
+      command,
+      args,
+      timeoutSeconds,
+      logDir: path.resolve(context.baseDir, logDir),
+      env,
+      savePrompt
+    };
+  },
+  create(config, dependencies) {
+    return new ClaudeCodeRunner(config, dependencies?.executor);
   }
 });
 

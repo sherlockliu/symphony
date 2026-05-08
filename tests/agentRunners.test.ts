@@ -3,11 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ClaudeCodeRunner } from "../src/agents/claudeCodeRunner.js";
 import { CodexRunner } from "../src/agents/codexRunner.js";
 import { createAgentRunner } from "../src/agents/createAgentRunner.js";
 import { DryRunRunner } from "../src/agents/dryRunRunner.js";
 import type { ProcessExecutor, ProcessRequest, ProcessResult } from "../src/agents/processExecutor.js";
-import type { CodexAgentConfig, DryRunAgentConfig } from "../src/agents/registry.js";
+import type { ClaudeCodeAgentConfig, CodexAgentConfig, DryRunAgentConfig } from "../src/agents/registry.js";
 import { ShellRunner } from "../src/agents/shellRunner.js";
 import type { AgentRunRequest, Issue, IssueWorkspace, WorkflowConfig } from "../src/types.js";
 
@@ -108,6 +109,7 @@ test("CodexRunner passes prompt, cwd, timeout, and log path to process executor"
   };
 
   try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
     const config: CodexAgentConfig = {
       kind: "codex",
       command: "codex",
@@ -125,7 +127,72 @@ test("CodexRunner passes prompt, cwd, timeout, and log path to process executor"
     assert.equal(calls[0]!.cwd, path.join(root, "workspaces", "ABC-7", "repo"));
     assert.equal(calls[0]!.input, request(root).prompt);
     assert.equal(calls[0]!.timeoutMs, 42000);
-    assert.equal(calls[0]!.logPath, path.join(root, "logs", "ABC-7-codex.log"));
+    assert.equal(calls[0]!.logPath, path.join(root, "workspaces", "ABC-7", ".orchestrator", "agent.log"));
+    assert.equal(await readFile(path.join(root, "workspaces", "ABC-7", ".orchestrator", "prompt.md"), "utf8"), "Implement ABC-7 with OPENAI_API_KEY=[REDACTED]");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodexRunner can run a fake agent command without invoking real Codex", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-codex-fake-"));
+  try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
+    const config: CodexAgentConfig = {
+      kind: "codex",
+      command: process.execPath,
+      args: [path.resolve("scripts/fake-agent.js")],
+      timeoutSeconds: 10,
+      logDir: path.join(root, "logs")
+    };
+
+    const result = await new CodexRunner(config).run(request(root));
+    const log = await readFile(path.join(root, "workspaces", "ABC-7", ".orchestrator", "agent.log"), "utf8");
+
+    assert.equal(result.success, true);
+    assert.equal(result.logPath, path.join(root, "workspaces", "ABC-7", ".orchestrator", "agent.log"));
+    assert.equal(result.logsPath, path.join(root, "workspaces", "ABC-7", ".orchestrator"));
+    assert.match(result.stdout, /fake agent prompt_length=/);
+    assert.match(log, /fake agent cwd=/);
+    assert.equal(log.includes("sk-testsecretvalue"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodexRunner dryRun writes prompt and agent log without executing a process", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-codex-dry-run-"));
+  const calls: ProcessRequest[] = [];
+  const executor: ProcessExecutor = {
+    async execute(processRequest: ProcessRequest): Promise<ProcessResult> {
+      calls.push(processRequest);
+      return {
+        exitCode: 1,
+        timedOut: false,
+        stdout: "",
+        stderr: "should not run"
+      };
+    }
+  };
+
+  try {
+    const config: CodexAgentConfig = {
+      kind: "codex",
+      command: "codex",
+      args: ["exec", "--full-auto"],
+      timeoutSeconds: 10,
+      logDir: path.join(root, "logs"),
+      dryRun: true
+    };
+    const result = await new CodexRunner(config, executor).run(request(root));
+    const prompt = await readFile(path.join(root, "workspaces", "ABC-7", ".orchestrator", "prompt.md"), "utf8");
+    const log = await readFile(path.join(root, "workspaces", "ABC-7", ".orchestrator", "agent.log"), "utf8");
+
+    assert.equal(calls.length, 0);
+    assert.equal(result.success, true);
+    assert.match(result.summary ?? "", /dry run/i);
+    assert.equal(prompt.includes("sk-testsecretvalue"), false);
+    assert.match(log, /dry_run: true/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -145,6 +212,7 @@ test("CodexRunner reports timeout failures", async () => {
   };
 
   try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
     const config: CodexAgentConfig = {
       kind: "codex",
       command: "codex",
@@ -189,6 +257,128 @@ test("CodexRunner captures stdout and stderr while process logs redact secrets",
     assert.match(log, /Bearer \[REDACTED\]/);
     assert.equal(log.includes("sk-testsecretvalue"), false);
     assert.equal(log.includes("abcdefghijklmnop"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodexRunner detects PR URL only when present in process output", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-codex-pr-url-"));
+  const executor: ProcessExecutor = {
+    async execute(): Promise<ProcessResult> {
+      return {
+        exitCode: 0,
+        timedOut: false,
+        stdout: "created https://github.com/acme/repo/pull/123",
+        stderr: ""
+      };
+    }
+  };
+
+  try {
+    await mkdir(path.join(root, "workspaces", "ABC-7", "repo"), { recursive: true });
+    const config: CodexAgentConfig = {
+      kind: "codex",
+      command: "codex",
+      args: ["exec", "-"],
+      timeoutSeconds: 10,
+      logDir: path.join(root, "logs")
+    };
+    const result = await new CodexRunner(config, executor).run(request(root));
+
+    assert.equal(result.pullRequestUrl, "https://github.com/acme/repo/pull/123");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodexRunner rejects merge commands in runner configuration", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-codex-merge-"));
+  try {
+    await assert.rejects(
+      () => new CodexRunner({
+        kind: "codex",
+        command: "gh",
+        args: ["pr", "merge", "--auto"],
+        timeoutSeconds: 10,
+        logDir: path.join(root, "logs")
+      }).run(request(root)),
+      /must not include merge commands/
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ClaudeCodeRunner passes prompt, cwd, timeout, env, and log path to process executor", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-claude-code-"));
+  const calls: ProcessRequest[] = [];
+  const executor: ProcessExecutor = {
+    async execute(processRequest: ProcessRequest): Promise<ProcessResult> {
+      calls.push(processRequest);
+      return {
+        exitCode: 0,
+        timedOut: false,
+        stdout: "ok",
+        stderr: ""
+      };
+    }
+  };
+
+  try {
+    const config: ClaudeCodeAgentConfig = {
+      kind: "claude-code",
+      command: "claude",
+      args: ["-p"],
+      timeoutSeconds: 120,
+      logDir: path.join(root, "logs"),
+      env: { ANTHROPIC_API_KEY: "test-key" }
+    };
+    const result = await new ClaudeCodeRunner(config, executor).run(request(root));
+
+    assert.equal(result.success, true);
+    assert.equal(result.runner, "claude-code");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.command, "claude");
+    assert.deepEqual(calls[0]!.args, ["-p"]);
+    assert.equal(calls[0]!.cwd, path.join(root, "workspaces", "ABC-7", "repo"));
+    assert.equal(calls[0]!.input, request(root).prompt);
+    assert.equal(calls[0]!.timeoutMs, 120000);
+    assert.equal(calls[0]!.logPath, path.join(root, "logs", "ABC-7-claude-code.log"));
+    assert.deepEqual(calls[0]!.env, { ANTHROPIC_API_KEY: "test-key" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ClaudeCodeRunner reports timeout failures", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-claude-timeout-"));
+  const executor: ProcessExecutor = {
+    async execute(): Promise<ProcessResult> {
+      return {
+        exitCode: null,
+        timedOut: true,
+        stdout: "",
+        stderr: "timeout"
+      };
+    }
+  };
+
+  try {
+    const config: ClaudeCodeAgentConfig = {
+      kind: "claude-code",
+      command: "claude",
+      args: ["-p"],
+      timeoutSeconds: 1,
+      logDir: path.join(root, "logs"),
+      env: {}
+    };
+    const result = await new ClaudeCodeRunner(config, executor).run(request(root));
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.error?.type, "agent_timeout");
+    assert.equal(result.error?.retryable, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -318,6 +508,17 @@ test("createAgentRunner keeps runner construction behind the generic interface",
       logDir: path.join(root, "logs")
     }
   }).kind, "codex");
+  assert.equal(createAgentRunner({
+    ...workflowConfig(root),
+    agent: {
+      kind: "claude-code",
+      command: "claude",
+      args: ["-p"],
+      timeoutSeconds: 60,
+      logDir: path.join(root, "logs"),
+      env: {}
+    }
+  }).kind, "claude-code");
   assert.equal(createAgentRunner({
     ...workflowConfig(root),
     agent: {

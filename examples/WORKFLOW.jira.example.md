@@ -3,11 +3,13 @@ version: 1
 tracker:
   kind: jira
   base_url: https://your-domain.atlassian.net
-  email: ${JIRA_EMAIL}
-  api_token: ${JIRA_API_TOKEN}
-  jql: 'project = ENG AND status = "Ready for Agent" ORDER BY priority ASC, updated ASC'
+  email_env: JIRA_EMAIL
+  api_token_env: JIRA_API_TOKEN
+  jql: 'project = MUL AND status = "Ready for AI" ORDER BY priority DESC'
+  ready_states:
+    - "Ready for AI"
   max_results: 50
-  review_transition: Human Review
+  review_state: Human Review
 workspace:
   root: ../.symphony/workspaces
 repository:

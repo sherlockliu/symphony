@@ -5,56 +5,48 @@ x-orchestrator-base: &orchestrator-base
   image: owned-symphony:local
   init: true
   working_dir: /app
+  restart: unless-stopped
   environment:
-    DATABASE_URL: ${DATABASE_URL:-postgres://orchestrator:orchestrator@postgres:5432/orchestrator}
     JIRA_EMAIL: ${JIRA_EMAIL:-}
     JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
-    PLANE_API_KEY: ${PLANE_API_KEY:-}
-    GH_TOKEN: ${GH_TOKEN:-}
-    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    PLANE_API_TOKEN: ${PLANE_API_TOKEN:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    GH_TOKEN: ${GH_TOKEN:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    DATABASE_URL: ${DATABASE_URL:-}
   volumes:
     - ./config:/config:ro
     - ./workspaces:/workspaces
     - ./logs:/logs
-  depends_on:
-    - postgres
+    - ./data:/data
 
 services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: orchestrator
-      POSTGRES_USER: orchestrator
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orchestrator}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
+  orchestrator-api:
+    <<: *orchestrator-base
+    command: ["api", "/config/WORKFLOW.md", "--host", "0.0.0.0", "--port", "4001"]
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:4001:4001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  orchestrator:
+  orchestrator-worker:
     <<: *orchestrator-base
-    command: ["validate", "/config/WORKFLOW.md"]
+    command: ["run", "/config/WORKFLOW.md", "--poll"]
+    depends_on:
+      orchestrator-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "/app/dist/cli/index.js", "validate", "/config/WORKFLOW.md"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
-  validate:
-    <<: *orchestrator-base
-    profiles: ["validate"]
-    command: ["validate", "/config/WORKFLOW.md"]
-
-  dry-run:
-    <<: *orchestrator-base
-    profiles: ["dry-run"]
-    command: ["dry-run", "/config/WORKFLOW.md"]
-
-  run:
-    <<: *orchestrator-base
-    profiles: ["run"]
-    command: ["run", "/config/WORKFLOW.md"]
-
-  daemon:
-    <<: *orchestrator-base
-    profiles: ["daemon"]
-    command: ["daemon", "/config/WORKFLOW.md"]
-
-volumes:
-  postgres-data:
+# Optional reverse proxy placeholder:
+# Add a private reverse proxy in front of orchestrator-api only when you also add
+# authentication and keep the public network boundary explicit.

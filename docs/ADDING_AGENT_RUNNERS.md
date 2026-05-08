@@ -168,7 +168,41 @@ redacted process logs.
 
 ---
 
-## Shell Runner
+## Built-In Process Runners
+
+### Codex Runner
+
+`agent.kind: codex` runs the configured Codex command in the repo workspace and passes the rendered
+prompt on stdin.
+
+```yaml
+agent:
+  kind: codex
+  command: codex
+  args: ["exec", "-"]
+  timeout_seconds: 900
+  log_dir: ../.symphony/logs
+```
+
+### Claude Code Runner
+
+`agent.kind: claude-code` runs the configured Claude Code command in the repo workspace and passes
+the rendered prompt on stdin. The default command shape is `claude -p`.
+
+```yaml
+agent:
+  kind: claude-code
+  command: claude
+  args: ["-p"]
+  timeout_seconds: 1800
+  log_dir: ../.symphony/logs
+  env:
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+```
+
+The repository tests mock process execution; they do not require Claude Code to be installed.
+
+### Shell Runner
 
 `agent.kind: shell` is the generic production extension point for Claude Code, Aider, Cursor CLI,
 internal agents, or custom scripts.

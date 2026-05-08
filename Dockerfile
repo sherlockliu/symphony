@@ -4,18 +4,20 @@ FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
 
-COPY package.json package-lock.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json vite.config.ts tailwind.config.js postcss.config.js ./
 COPY src ./src
+COPY ui ./ui
 COPY tests ./tests
 
 RUN npm ci
 RUN npm run build
+RUN npm run ui:build
 RUN npm prune --omit=dev
 
 FROM node:22-bookworm-slim AS runtime
 
 LABEL org.opencontainers.image.title="Owned Symphony"
-LABEL org.opencontainers.image.description="Tracker-agnostic coding-agent orchestrator CLI"
+LABEL org.opencontainers.image.description="Tracker-agnostic coding-agent orchestrator API, UI, and worker"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \
@@ -41,14 +43,16 @@ WORKDIR /app
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/package-lock.json ./package-lock.json
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/dist-ui ./dist-ui
 COPY --from=build /app/node_modules ./node_modules
 
-RUN mkdir -p /config /workspaces /logs \
-  && chown -R node:node /app /config /workspaces /logs
+RUN mkdir -p /app/dist/cli /config /workspaces /logs /data \
+  && ln -s ../src/cli/index.js /app/dist/cli/index.js \
+  && chown -R node:node /app /config /workspaces /logs /data
 
 USER node
 
 ENV NODE_ENV=production
 
-ENTRYPOINT ["node", "/app/dist/src/cli/index.js"]
+ENTRYPOINT ["node", "/app/dist/cli/index.js"]
 CMD ["validate", "/config/WORKFLOW.md"]

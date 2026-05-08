@@ -29,10 +29,12 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
   const daemon = objectAt(config, "daemon", issues, "daemon", false);
   const dashboard = objectAt(config, "dashboard", issues, "dashboard", false);
   const retry = objectAt(config, "retry", issues, "retry", false);
+  const safety = objectAt(config, "safety", issues, "safety", false);
 
   const version = numberAt(config, "version", issues);
   const trackerConfig = validateTrackerConfig(tracker, { baseDir, issues });
   const stateKind = optionalStringAt(state, "kind", issues, "state.kind") ?? "memory";
+  const stateFilePath = optionalStringAt(state, "filePath", issues, "state.file_path");
   const postgresConnectionString = optionalStringAt(state, "connectionString", issues, "state.connection_string");
   const postgresLockTtlSeconds = optionalNumberAt(state, "lockTtlSeconds", issues, "state.lock_ttl_seconds") ?? 900;
   const agentConfig = validateAgentConfig(agent, { baseDir, issues });
@@ -65,6 +67,9 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
   const retryWithExistingPullRequest =
     optionalBooleanAt(retry, "retryWithExistingPullRequest", issues, "retry.retry_with_existing_pull_request") ?? false;
   const rerunSucceeded = optionalBooleanAt(retry, "rerunSucceeded", issues, "retry.rerun_succeeded") ?? false;
+  const allowAutoMerge = optionalBooleanAt(safety, "allowAutoMerge", issues, "safety.allow_auto_merge") ?? false;
+  const allowedCommands = optionalStringArrayAt(safety, "allowedCommands", issues, "safety.allowed_commands") ?? [];
+  const blockedCommands = optionalStringArrayAt(safety, "blockedCommands", issues, "safety.blocked_commands") ?? [];
 
   if (version !== undefined && version !== 1) {
     issues.push("version must be 1.");
@@ -75,8 +80,15 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
   if (githubDraft !== undefined && githubDraft !== true) {
     issues.push("github.draft must be true; Symphony never creates ready-for-review PRs automatically.");
   }
-  if (stateKind !== "memory" && stateKind !== "postgres") {
-    issues.push("state.kind must be memory or postgres when provided. SQLite is not implemented in this repository.");
+  if (stateKind !== "memory" && stateKind !== "json" && stateKind !== "postgres") {
+    issues.push("state.kind must be memory, json, or postgres when provided. SQLite is not implemented in this repository.");
+  }
+  if (stateKind === "json") {
+    if (stateFilePath === undefined) {
+      issues.push("state.file_path must be provided when state.kind is json.");
+    } else if (stateFilePath.includes("\0")) {
+      issues.push("state.file_path contains an invalid null byte.");
+    }
   }
   if (stateKind === "postgres") {
     if (postgresConnectionString === undefined) {
@@ -124,15 +136,7 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
     version: 1,
     workflowPath: path.resolve(workflowPath),
     tracker: trackerConfig!,
-    state: stateKind === "postgres"
-      ? {
-          kind: "postgres",
-          connectionString: postgresConnectionString!,
-          lockTtlSeconds: postgresLockTtlSeconds
-        }
-      : {
-          kind: "memory"
-        },
+    state: stateConfigFor(stateKind, baseDir, stateFilePath, postgresConnectionString, postgresLockTtlSeconds),
     workspace: {
       root: path.resolve(baseDir, workspaceRoot!)
     },
@@ -172,7 +176,37 @@ export function validateWorkflow(definition: WorkflowDefinition, workflowPath: s
       enabled: dashboardEnabled,
       host: dashboardHost,
       port: dashboardPort
+    },
+    safety: {
+      allowAutoMerge,
+      allowedCommands,
+      blockedCommands
     }
+  };
+}
+
+function stateConfigFor(
+  kind: string,
+  baseDir: string,
+  stateFilePath: string | undefined,
+  postgresConnectionString: string | undefined,
+  postgresLockTtlSeconds: number
+): WorkflowConfig["state"] {
+  if (kind === "postgres") {
+    return {
+      kind: "postgres",
+      connectionString: postgresConnectionString!,
+      lockTtlSeconds: postgresLockTtlSeconds
+    };
+  }
+  if (kind === "json") {
+    return {
+      kind: "json",
+      filePath: path.resolve(baseDir, stateFilePath!)
+    };
+  }
+  return {
+    kind: "memory"
   };
 }
 

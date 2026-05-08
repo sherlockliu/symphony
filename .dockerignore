@@ -1,8 +1,12 @@
 .git
 .github/media
 .symphony
+.orchestrator
 config
+coverage
+data
 dist
+dist-ui
 logs
 node_modules
 workspaces

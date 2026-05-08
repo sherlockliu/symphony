@@ -2,10 +2,12 @@
 version: 1
 tracker:
   kind: plane
-  base_url: https://api.plane.so
-  api_key: ${PLANE_API_KEY}
-  workspace_slug: your-workspace
+  base_url: https://plane.example.com
+  api_token_env: PLANE_API_TOKEN
+  workspace_slug: engineering
   project_id: your-project-id
+  ready_states:
+    - "Ready for AI"
   max_results: 50
   review_state: Human Review
 workspace:
@@ -28,7 +30,7 @@ agent:
   timeout_seconds: 900
   log_dir: ../.symphony/logs
 states:
-  active: ["Ready for Agent", "In Progress"]
+  active: ["Ready for AI", "In Progress"]
   terminal: ["Done", "Canceled"]
 limits:
   max_concurrency: 1

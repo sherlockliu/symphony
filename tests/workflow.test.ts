@@ -331,7 +331,7 @@ test("validateWorkflow rejects unsupported tracker kinds", () => {
 test("validateWorkflow rejects unsupported agent runner kinds", () => {
   const parsed = parseWorkflow(
     validWorkflow
-      .replace("kind: dry-run", "kind: claude-code")
+      .replace("kind: dry-run", "kind: aider")
       .replace("${WORKSPACE_ROOT}", "./tmp/workspaces")
   );
 
@@ -348,26 +348,28 @@ test("validateWorkflow accepts Jira tracker configuration", () => {
       [
         "kind: jira",
         "  base_url: https://example.atlassian.net",
-        "  email: bot@example.com",
-        "  api_token: token-secret",
+        "  email_env: JIRA_EMAIL",
+        "  api_token_env: JIRA_API_TOKEN",
         "  jql: 'project = ENG AND status = \"Ready for Agent\"'",
+        "  ready_states: [\"Ready for Agent\"]",
         "  max_results: 25",
-        "  review_transition: Human Review"
+        "  review_state: Human Review"
       ].join("\n")
     )
     .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
   const parsed = parseWorkflow(workflow);
   const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
 
-  assert.equal(config.tracker.kind, "jira");
-  if (config.tracker.kind === "jira") {
-    assert.equal(config.tracker.baseUrl, "https://example.atlassian.net");
-    assert.equal(config.tracker.email, "bot@example.com");
-    assert.equal(config.tracker.apiToken, "token-secret");
-    assert.equal(config.tracker.jql, 'project = ENG AND status = "Ready for Agent"');
-    assert.equal(config.tracker.maxResults, 25);
-    assert.equal(config.tracker.reviewTransition, "Human Review");
-  }
+    assert.equal(config.tracker.kind, "jira");
+    if (config.tracker.kind === "jira") {
+      assert.equal(config.tracker.baseUrl, "https://example.atlassian.net");
+      assert.equal(config.tracker.emailEnv, "JIRA_EMAIL");
+      assert.equal(config.tracker.apiTokenEnv, "JIRA_API_TOKEN");
+      assert.equal(config.tracker.jql, 'project = ENG AND status = "Ready for Agent"');
+      assert.deepEqual(config.tracker.readyStates, ["Ready for Agent"]);
+      assert.equal(config.tracker.maxResults, 25);
+      assert.equal(config.tracker.reviewState, "Human Review");
+    }
 });
 
 test("validateWorkflow accepts Plane tracker configuration", () => {
@@ -377,9 +379,10 @@ test("validateWorkflow accepts Plane tracker configuration", () => {
       [
         "kind: plane",
         "  base_url: https://api.plane.so",
-        "  api_key: plane-secret",
+        "  api_token_env: PLANE_API_TOKEN",
         "  workspace_slug: acme",
         "  project_id: project-1",
+        "  ready_states: [\"Ready for AI\"]",
         "  max_results: 25",
         "  review_state: Human Review"
       ].join("\n")
@@ -388,20 +391,21 @@ test("validateWorkflow accepts Plane tracker configuration", () => {
   const parsed = parseWorkflow(workflow);
   const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
 
-  assert.equal(config.tracker.kind, "plane");
-  if (config.tracker.kind === "plane") {
-    assert.equal(config.tracker.baseUrl, "https://api.plane.so");
-    assert.equal(config.tracker.apiKey, "plane-secret");
-    assert.equal(config.tracker.workspaceSlug, "acme");
-    assert.equal(config.tracker.projectId, "project-1");
-    assert.equal(config.tracker.maxResults, 25);
-    assert.equal(config.tracker.reviewState, "Human Review");
-  }
+    assert.equal(config.tracker.kind, "plane");
+    if (config.tracker.kind === "plane") {
+      assert.equal(config.tracker.baseUrl, "https://api.plane.so");
+      assert.equal(config.tracker.apiTokenEnv, "PLANE_API_TOKEN");
+      assert.equal(config.tracker.workspaceSlug, "acme");
+      assert.equal(config.tracker.projectId, "project-1");
+      assert.deepEqual(config.tracker.readyStates, ["Ready for AI"]);
+      assert.equal(config.tracker.maxResults, 25);
+      assert.equal(config.tracker.reviewState, "Human Review");
+    }
 });
 
 test("validateWorkflow accepts codex runner configuration", () => {
   const workflow = validWorkflow
-    .replace("kind: dry-run", "kind: codex\n  command: codex\n  args: [\"exec\", \"-\", \"--json\"]")
+    .replace("kind: dry-run", "kind: codex\n  command: codex\n  args: [\"exec\", \"-\", \"--json\"]\n  max_turns: 20\n  dry_run: true")
     .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
   const parsed = parseWorkflow(workflow);
   const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
@@ -410,8 +414,36 @@ test("validateWorkflow accepts codex runner configuration", () => {
   if (config.agent.kind === "codex") {
     assert.equal(config.agent.command, "codex");
     assert.deepEqual(config.agent.args, ["exec", "-", "--json"]);
+    assert.equal(config.agent.maxTurns, 20);
+    assert.equal(config.agent.dryRun, true);
     assert.equal(config.agent.timeoutSeconds, 300);
     assert.equal(config.agent.logDir, "/repo/examples/logs");
+  }
+});
+
+test("validateWorkflow accepts Claude Code runner configuration", () => {
+  const workflow = validWorkflow
+    .replace(
+      "kind: dry-run",
+      [
+        "kind: claude-code",
+        "  command: claude",
+        "  args: [\"-p\"]",
+        "  env:",
+        "    ANTHROPIC_API_KEY: test-key"
+      ].join("\n")
+    )
+    .replace("${WORKSPACE_ROOT}", "./tmp/workspaces");
+  const parsed = parseWorkflow(workflow);
+  const config = validateWorkflow(parsed, "/repo/examples/WORKFLOW.md");
+
+  assert.equal(config.agent.kind, "claude-code");
+  if (config.agent.kind === "claude-code") {
+    assert.equal(config.agent.command, "claude");
+    assert.deepEqual(config.agent.args, ["-p"]);
+    assert.equal(config.agent.timeoutSeconds, 300);
+    assert.equal(config.agent.logDir, "/repo/examples/logs");
+    assert.deepEqual(config.agent.env, { ANTHROPIC_API_KEY: "test-key" });
   }
 });
 
